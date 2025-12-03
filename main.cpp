@@ -1,26 +1,26 @@
 /*
-Copyright 12/03/2025 https://github.com/su8/0vershell
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
-MA 02110-1301, USA.
-*/
+ * Copyright 12/03/2025 https://github.com/su8/0vershell
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ */
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <vector>
 #include <string>
-#include <unistd.h> 
+#include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <cstring>
@@ -30,6 +30,23 @@ MA 02110-1301, USA.
 #include <dirent.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <map>
+
+struct Command {
+  std::vector<char*> args;
+  std::string infile;
+  std::string outfile;
+  bool append = false;
+};
+
+struct Job {
+  pid_t pgid;
+  std::string command;
+  bool running;
+};
+
+std::map<int, Job> jobs;
+int nextJobId = 1;
 
 std::string trim(const std::string &s);
 void initHistoryPath(void);
@@ -41,7 +58,12 @@ void executeCommand(const std::string &cmd);
 void loadSystemCommands(void);
 char *commandGenerator(const char* text, int state);
 char **myCompletion(const char *text, int start, int end);
-void executePipeline(const std::vector<std::string> &commands, bool background);
+void executePipeline(std::vector<Command> &commands, bool background, const std::string &fullCmd);
+void freeArgs(std::vector<char*> &args);
+Command parseSingleCommand(const std::string &cmdStr);
+void listJobs(void);
+void fgJob(int jobId);
+void bgJob(int jobId);
 
 #define HISTORY_FILE ".0vershell"
 
@@ -55,66 +77,161 @@ int main(void) {
   loadSystemCommands();
   rl_attempted_completion_function = myCompletion;
   signal(SIGCHLD, sigchldHandler);
+  signal(SIGTTOU, SIG_IGN);
+
   while (true) {
-    char *input = readline("myshell> ");
+    char *input = readline("0vershell> ");
     if (!input) { // EOF (Ctrl+D)
       std::cout << "\n";
       break;
     }
-    std::string cmd(trim(static_cast<std::string>(input)));
+    std::string cmd2(trim(static_cast<std::string>(input)));
     free(input);
-    if (cmd.empty()) continue;
-    add_history(cmd.c_str());
+    if (cmd2.empty()) continue;
+    add_history(cmd2.c_str());
     append_history(1, historyPath.c_str());
-    if (cmd == "exit") break;
-    if (cmd == "history") {
+    if (cmd2 == "exit") break;
+    if (cmd2 == "history") {
       HIST_ENTRY** histList = history_list();
       if (histList) {
         for (int x = 0; histList[x]; x++) { std::cout << (x + history_base) << ": " << histList[x]->line << "\n"; }
       }
       continue;
     }
-    // History execution: !!
-    if (cmd == "!!") {
-      HIST_ENTRY* last = previous_history();
-      if (!last) {
-        std::cout << "No commands in history.\n";
-      } else {
-        std::cout << "Running: " << last->line << "\n";
-        executeCommand(last->line);
-      }
+    // Built-in jobs
+    if (cmd2 == "jobs") {
+      listJobs();
       continue;
     }
-    // History execution: !N
-    if (cmd[0] == '!' && std::isdigit(cmd[1])) {
-      int cmdNum = std::stoi(cmd.substr(1));
-      HIST_ENTRY** histList = history_list();
-      if (!histList || cmdNum < history_base || cmdNum >= history_base + history_length) {
-        std::cout << "No such command in history.\n";
-      } else {
-        std::cout << "Running: " << histList[cmdNum - history_base]->line << "\n";
-        executeCommand(histList[cmdNum - history_base]->line);
-      }
+    // Built-in fg
+    if (cmd2.rfind("fg", 0) == 0) {
+      std::istringstream iss(cmd2);
+      std::string cmd;
+      int jobId;
+      iss >> cmd >> jobId;
+      fgJob(jobId);
       continue;
     }
-    // Check for background process
+    // Built-in bg
+    if (cmd2.rfind("bg", 0) == 0) {
+      std::istringstream iss(cmd2);
+      std::string cmd;
+      int jobId;
+      iss >> cmd >> jobId;
+      bgJob(jobId);
+      continue;
+    }
+    // Detect background execution
     bool background = false;
-    if (cmd.back() == '&') {
+    if (!cmd2.empty() && cmd2.back() == '&') {
       background = true;
-      cmd.pop_back();
-      cmd = trim(cmd);
+      cmd2.pop_back();
+      if (!cmd2.empty() && cmd2.back() == ' ')
+        cmd2.pop_back();
     }
-    // Split by pipe
-    std::vector<std::string> commands;
-    std::stringstream ss(cmd);
+    // Split by pipeline '|'
+    std::vector<Command> commands;
+    std::stringstream ss(cmd2);
     std::string segment;
     while (std::getline(ss, segment, '|')) {
-      commands.push_back(trim(segment));
+      commands.push_back(parseSingleCommand(segment));
     }
-    executePipeline(commands, background);
+    // Execute pipeline
+    executePipeline(commands, background, cmd2);
+    // Free allocated args
+    for (auto &cmdz : commands) {
+      freeArgs(cmdz.args);
+    }
   }
   savePersistentHistory();
   return EXIT_SUCCESS;
+}
+
+// Free allocated args
+void freeArgs(std::vector<char*> &args) {
+  for (char* arg : args) delete[] arg;
+  args.clear();
+}
+
+// Parse a single command string into Command struct
+Command parseSingleCommand(const std::string &cmdStr) {
+  Command cmd;
+  std::stringstream ss(cmdStr);
+  std::string token;
+
+  while (ss >> token) {
+    if (token == "<") {
+      ss >> cmd.infile;
+    } else if (token == ">") {
+      ss >> cmd.outfile;
+      cmd.append = false;
+    } else if (token == ">>") {
+      ss >> cmd.outfile;
+      cmd.append = true;
+    } else {
+      char *arg = new char[token.size() + 1];
+      std::strcpy(arg, token.c_str());
+      cmd.args.push_back(arg);
+    }
+  }
+  cmd.args.push_back(nullptr);
+  return cmd;
+}
+
+// List jobs
+void listJobs() {
+  for (auto &j : jobs) {
+    std::cout << "[" << j.first << "] "
+    << (j.second.running ? "Running" : "Stopped")
+    << " " << j.second.command
+    << " (PGID " << j.second.pgid << ")\n";
+  }
+}
+
+// Bring job to foreground
+void fgJob(int jobId) {
+  if (jobs.find(jobId) == jobs.end()) {
+    std::cerr << "fg: no such job\n";
+    return;
+  }
+  Job &job = jobs[jobId];
+  tcsetpgrp(STDIN_FILENO, job.pgid);
+  kill(-job.pgid, SIGCONT);
+  int status;
+  waitpid(-job.pgid, &status, WUNTRACED);
+  tcsetpgrp(STDIN_FILENO, getpgrp());
+  if (WIFSTOPPED(status)) {
+    job.running = false;
+  } else {
+    jobs.erase(jobId);
+  }
+}
+
+// Resume job in background
+void bgJob(int jobId) {
+  if (jobs.find(jobId) == jobs.end()) {
+    std::cerr << "bg: no such job\n";
+    return;
+  }
+  Job &job = jobs[jobId];
+  kill(-job.pgid, SIGCONT);
+  job.running = true;
+}
+
+// Signal handler for background process completion
+void sigchldHandler(int) {
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    for (auto it = jobs.begin(); it != jobs.end();) {
+      if (it->second.pgid == pid) {
+        std::cout << "\n[" << it->first << "] Done " << it->second.command << "\n";
+        it = jobs.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 }
 
 // ======== Utility Functions ========
@@ -125,159 +242,186 @@ std::string trim(const std::string &s) {
   size_t end = s.find_last_not_of(" \t");
   return (start == std::string::npos) ? "" : s.substr(start, end - start + 1); }
 
-// Build history file path
-void initHistoryPath(void) {
-  const char *home = getenv("HOME");
-  if (!home) home = ".";
-  historyPath = std::string(home) + "/" + HISTORY_FILE;
-}
-
-// Load persistent history
-void loadPersistentHistory(void) {
-  using_history();
-  read_history(historyPath.c_str());
-}
-
-// Save persistent history
-void savePersistentHistory(void) {
-  write_history(historyPath.c_str());
-}
-
-// Handle SIGCHLD to prevent zombies
-void sigchldHandler(int) {
-  while (waitpid(-1, nullptr, WNOHANG) > 0);
-}
-
-// Parse input into args
-std::vector<char*> parseInput(std::string cmd) {
-  std::vector<char*> args;
-  std::istringstream iss(cmd);
-  std::string token;
-  while (iss >> token) {
-    char* arg = new char[token.size() + 1];
-    std::strcpy(arg, token.c_str());
-    args.push_back(arg);
+  // Build history file path
+  void initHistoryPath(void) {
+    const char *home = getenv("HOME");
+    if (!home) home = ".";
+    historyPath = std::string(home) + "/" + HISTORY_FILE;
   }
-  args.push_back(nullptr);
-  return args;
-}
 
-// Execute a single command with optional redirection
-void executeCommand(const std::string &cmd) {
-  auto args = parseInput(cmd);
-  if (args.size() <= 1) return;
-  bool background = false;
-  if (args.size() > 2 && std::string(args[args.size() - 2]) == "&") {
-    background = true;
-    delete[] args[args.size() - 2];
-    args[args.size() - 2] = nullptr;
+  // Load persistent history
+  void loadPersistentHistory(void) {
+    using_history();
+    read_history(historyPath.c_str());
   }
-  pid_t pid = fork();
-  if (pid < 0) {
-    perror("fork failed");
-  } else if (pid == 0) {
-    execvp(args[0], args.data());
-    perror("exec failed");
-    exit(EXIT_FAILURE);
-  } else {
-    if (!background) {
-      waitpid(pid, nullptr, 0);
-    } else {
-      std::cout << "[Background PID: " << pid << "]\n";
+
+  // Save persistent history
+  void savePersistentHistory(void) {
+    write_history(historyPath.c_str());
+  }
+
+  // Parse input into args
+  std::vector<char*> parseInput(std::string cmd) {
+    std::vector<char*> args;
+    std::istringstream iss(cmd);
+    std::string token;
+    while (iss >> token) {
+      char* arg = new char[token.size() + 1];
+      std::strcpy(arg, token.c_str());
+      args.push_back(arg);
     }
+    args.push_back(nullptr);
+    return args;
   }
-  for (size_t i = 0; i < args.size(); ++i) {
-    delete[] args[i];
-  }
-}
 
-// ======== Tab Completion ========
-
-// Load all commands from PATH into commandList
-void loadSystemCommands(void) {
-  char *pathEnv = getenv("PATH");
-  if (!pathEnv) return;
-
-  std::string pathCopy(pathEnv);
-  std::istringstream iss(pathCopy);
-  std::string dir;
-  while (std::getline(iss, dir, ':')) {
-    DIR* dp = opendir(dir.c_str());
-    if (dp) {
-      struct dirent *entry;
-      while ((entry = readdir(dp)) != nullptr) {
-        if (entry->d_type == DT_REG || entry->d_type == DT_LNK || entry->d_type == DT_UNKNOWN) {
-          commandList.push_back(entry->d_name);
-        }
-      }
-      closedir(dp);
-    }
-  }
-}
-
-// Generator function for readline
-char *commandGenerator(const char *text, int state) {
-  static size_t listIndex;
-  static size_t len;
-  if (!state) {
-    listIndex = 0;
-    len = std::strlen(text);
-  }
-  while (listIndex < commandList.size()) {
-    const std::string &name = commandList[listIndex++];
-    if (name.compare(0, len, text) == 0) {
-      return strdup(name.c_str());
-    }
-  }
-  return nullptr;
-}
-
-// Completion function
-char **myCompletion(const char *text, int start, int end) {
-  static_cast<void>(end);
-  if (start == 0) {
-    return rl_completion_matches(text, commandGenerator);
-  }
-  return nullptr; // Default filename completion
-}
-
-// Execute a pipeline of commands
-void executePipeline(const std::vector<std::string> &commands, bool background) {
-  int numCmds = commands.size();
-  int pipefd[2], in_fd = 0;
-
-  for (int i = 0; i < numCmds; i++) {
-    if (i < numCmds - 1) {
-      if (pipe(pipefd) == -1) { perror("pipe"); exit(EXIT_FAILURE); }
+  // Execute a single command with optional redirection
+  void executeCommand(const std::string &cmd) {
+    auto args = parseInput(cmd);
+    if (args.size() <= 1) return;
+    bool background = false;
+    if (args.size() > 2 && std::string(args[args.size() - 2]) == "&") {
+      background = true;
+      delete[] args[args.size() - 2];
+      args[args.size() - 2] = nullptr;
     }
     pid_t pid = fork();
     if (pid < 0) {
-      perror("fork");
-      exit(EXIT_FAILURE);
+      perror("fork failed");
     } else if (pid == 0) {
-      // Child process
-      if (i > 0) { // Not first command
-        dup2(in_fd, STDIN_FILENO);
-        close(in_fd);
-      }
-      if (i < numCmds - 1) { // Not last command
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-      }
-      executeCommand(commands[i]);
+      execvp(args[0], args.data());
+      perror("exec failed");
+      exit(EXIT_FAILURE);
     } else {
-      // Parent process
-      if (i > 0) close(in_fd);
-      if (i < numCmds - 1) {
-        close(pipefd[1]);
-        in_fd = pipefd[0];
-      }
-      if (!background || i < numCmds - 1) {
+      if (!background) {
         waitpid(pid, nullptr, 0);
       } else {
-        std::cout << "[Background PID] " << pid << "\n";
+        std::cout << "[Background PID: " << pid << "]\n";
+      }
+    }
+    for (size_t i = 0; i < args.size(); ++i) {
+      delete[] args[i];
+    }
+  }
+
+  // ======== Tab Completion ========
+
+  // Load all commands from PATH into commandList
+  void loadSystemCommands(void) {
+    char *pathEnv = getenv("PATH");
+    if (!pathEnv) return;
+
+    std::string pathCopy(pathEnv);
+    std::istringstream iss(pathCopy);
+    std::string dir;
+    while (std::getline(iss, dir, ':')) {
+      DIR* dp = opendir(dir.c_str());
+      if (dp) {
+        struct dirent *entry;
+        while ((entry = readdir(dp)) != nullptr) {
+          if (entry->d_type == DT_REG || entry->d_type == DT_LNK || entry->d_type == DT_UNKNOWN) {
+            commandList.push_back(entry->d_name);
+          }
+        }
+        closedir(dp);
       }
     }
   }
+
+  // Generator function for readline
+  char *commandGenerator(const char *text, int state) {
+    static size_t listIndex;
+    static size_t len;
+    if (!state) {
+      listIndex = 0;
+      len = std::strlen(text);
+    }
+    while (listIndex < commandList.size()) {
+      const std::string &name = commandList[listIndex++];
+      if (name.compare(0, len, text) == 0) {
+        return strdup(name.c_str());
+      }
+    }
+    return nullptr;
+  }
+
+  // Completion function
+  char **myCompletion(const char *text, int start, int end) {
+    static_cast<void>(end);
+    if (start == 0) {
+      return rl_completion_matches(text, commandGenerator);
+    }
+    return nullptr; // Default filename completion
+  }
+
+  // Execute a pipeline of commands
+  void executePipeline(std::vector<Command> &commands, bool background, const std::string &fullCmd) {
+    int numCmds = commands.size();
+    int pipefds[2 * (numCmds - 1)];
+
+    // Create pipes
+    for (int i = 0; i < numCmds - 1; i++) {
+      if (pipe(pipefds + i*2) < 0) {
+        perror("pipe");
+        return;
+      }
+    }
+
+    pid_t pgid = 0;
+    for (int i = 0; i < numCmds; i++) {
+      pid_t pid = fork();
+      if (pid == 0) {
+        // Child process
+        if (pgid == 0) pgid = getpid();
+        setpgid(0, pgid);
+        // Redirect input from previous pipe
+        if (i > 0) dup2(pipefds[(i-1)*2], STDIN_FILENO);
+        // Redirect output to next pipe
+        if (i < numCmds - 1) dup2(pipefds[i*2 + 1], STDOUT_FILENO);
+        // Close all pipe fds
+        for (int j = 0; j < 2*(numCmds-1); j++) close(pipefds[j]);
+        // Handle input redirection
+        if (!commands[i].infile.empty()) {
+          int fd = open(commands[i].infile.c_str(), O_RDONLY);
+          if (fd < 0) { perror("open infile"); exit(1); }
+          dup2(fd, STDIN_FILENO);
+          close(fd);
+        }
+        // Handle output redirection
+        if (!commands[i].outfile.empty()) {
+          int fd = open(commands[i].outfile.c_str(), O_WRONLY | O_CREAT | (commands[i].append ? O_APPEND : O_TRUNC), 0644);
+          if (fd < 0) { perror("open outfile"); exit(1); }
+          dup2(fd, STDOUT_FILENO);
+          close(fd);
+        }
+        // Execute command
+        if (execvp(commands[i].args[0], commands[i].args.data()) == -1) {
+          perror("execvp");
+          exit(1);
+        }
+      }
+      else if (pid > 0) {
+        if (pgid == 0) pgid = pid;
+        setpgid(pid, pgid);
+      }
+      else {
+        perror("fork");
+      }
+    }
+    // Close all pipe fds in parent
+    for (int i = 0; i < 2*(numCmds-1); i++) close(pipefds[i]);
+    if (background) {
+      jobs[nextJobId] = {pgid, fullCmd, true};
+      std::cout << "[" << nextJobId << "] " << pgid << "\n";
+      nextJobId++;
+    } else {
+      tcsetpgrp(STDIN_FILENO, pgid);
+      int status;
+      waitpid(-pgid, &status, WUNTRACED);
+      tcsetpgrp(STDIN_FILENO, getpgrp());
+      if (WIFSTOPPED(status)) {
+        jobs[nextJobId] = {pgid, fullCmd, false};
+        std::cout << "[" << nextJobId << "] Stopped " << fullCmd << "\n";
+        nextJobId++;
+      }
+    }
 }
