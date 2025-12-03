@@ -70,11 +70,10 @@ std::string toAbsolutePath(const std::string &path);
 std::string expandEnvVars(const std::string &path);
 std::vector<char *> splitArgs(const std::string &cmd);
 std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &aliases);
+std::string doEcho( const std::string &input, const std::unordered_map<std::string, std::string> &vars);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
-
-#define HISTORY_FILE ".0vershell"
 
 std::vector<std::string> commandList;
 std::vector<std::string> historyList; // Command history
@@ -165,6 +164,10 @@ int main(void) {
       variables[name] = value;
       continue;
     }
+    if (cmd2.rfind("echo", 0) == 0) {
+      std::cout << doEcho(cmd2.substr(5), variables) << std::endl;
+      continue;
+    }
     cmd2 = expandEnvVars(cmd2);
     // Built-in jobs
     if (cmd2 == "jobs") {
@@ -224,6 +227,35 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
+// Function to replace variables in the input string based on a regex pattern and a map
+std::string doEcho( const std::string &input, const std::unordered_map<std::string, std::string> &vars) {
+  //std::regex varPattern(R"(\$\{(\w+)\})"); // matches ${var}
+  std::regex varPattern(R"(\$([A-Za-z_][A-Za-z0-9_]*))");
+  std::string result;
+  std::sregex_iterator currentMatch(input.begin(), input.end(), varPattern);
+  std::sregex_iterator lastMatch;
+  size_t lastPos = 0;
+  while (currentMatch != lastMatch) {
+    const std::smatch &match = *currentMatch;
+    // Append text before the match
+    result.append(input, lastPos, match.position() - lastPos);
+    // Extract variable name from capture group 1
+    std::string varName = match[1].str();
+    // Replace with value from map if found, else empty string
+    auto it = vars.find(varName);
+    if (it != vars.end()) {
+      result.append(it->second);
+    }
+    // Update last position
+    lastPos = match.position() + match.length();
+    ++currentMatch;
+  }
+  // Append remaining text after last match
+  result.append(input, lastPos, std::string::npos);
+  return result;
+}
+
+
 std::string expandTile(const std::string &path) {
   if (path.empty() || path[0] != '~') {
     return path;
@@ -269,7 +301,6 @@ Command parseSingleCommand(const std::string &cmdStr) {
   Command cmd;
   std::stringstream ss(cmdStr);
   std::string token;
-
   while (ss >> token) {
     if (token == "<") {
       ss >> cmd.infile;
@@ -385,7 +416,7 @@ std::string trim(const std::string &s) {
   void initHistoryPath(void) {
     const char *home = getenv("HOME");
     if (!home) home = ".";
-    historyPath = std::string(home) + "/" + HISTORY_FILE;
+    historyPath = std::string(home) + "/.0vershell.txt";
   }
 
   // Load persistent history
