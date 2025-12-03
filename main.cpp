@@ -37,12 +37,12 @@ void loadPersistentHistory(void);
 void savePersistentHistory(void);
 void sigchldHandler(int);
 std::vector<char*> parseInput(std::string cmd);
-void loadHistory(void);
 void executeCommand(const std::string &cmd);
 void loadSystemCommands(void);
 char* commandGenerator(const char* text, int state);
 char **myCompletion(const char *text, int start, int end);
 void executePipeline(const std::vector<std::string> &commands, bool background);
+//void loadHistory(void);
 
 #define HISTORY_FILE ".0vershell"
 
@@ -164,30 +164,6 @@ std::vector<char*> parseInput(std::string cmd) {
   return args;
 }
 
-// Load history from file
-void loadHistory(void) {
-  std::ifstream file(historyPath);
-  std::string line;
-  while (std::getline(file, line)) {
-    if (!line.empty()) historyList.push_back(line);
-  }
-}
-
-/* Append a command to history file
-// Split a command string into tokens
-std::vector<char*> parseCommand(const std::string &cmd) {
-    std::stringstream ss(cmd);
-    std::string token;
-    std::vector<char*> args;
-    while (ss >> token) {
-        char *arg = new char[token.size() + 1];
-        std::strcpy(arg, token.c_str());
-        args.push_back(arg);
-    }
-    args.push_back(nullptr);
-    return args;
-}*/
-
 // Execute a single command with optional redirection
 // Execute a command
 void executeCommand(const std::string &cmd) {
@@ -308,3 +284,27 @@ void executePipeline(const std::vector<std::string> &commands, bool background) 
     }
   }
 }
+
+// Load history from file
+/*void loadHistory(void) {
+  std::ifstream file(historyPath);
+  std::string line;
+  while (std::getline(file, line)) {
+    if (!line.empty()) historyList.push_back(line);
+  }
+}*/
+
+/* Append a command to history file
+// Split a command string into tokens
+std::vector<char*> parseCommand(const std::string &cmd) {
+    std::stringstream ss(cmd);
+    std::string token;
+    std::vector<char*> args;
+    while (ss >> token) {
+        char *arg = new char[token.size() + 1];
+        std::strcpy(arg, token.c_str());
+        args.push_back(arg);
+    }
+    args.push_back(nullptr);
+    return args;
+}*/
