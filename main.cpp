@@ -39,7 +39,7 @@ void sigchldHandler(int);
 std::vector<char*> parseInput(std::string cmd);
 void executeCommand(const std::string &cmd);
 void loadSystemCommands(void);
-char* commandGenerator(const char* text, int state);
+char *commandGenerator(const char* text, int state);
 char **myCompletion(const char *text, int start, int end);
 void executePipeline(const std::vector<std::string> &commands, bool background);
 
@@ -49,7 +49,6 @@ std::vector<std::string> commandList;
 std::vector<std::string> historyList; // Command history
 std::string historyPath;
 
-
 int main(void) {
   initHistoryPath();
   loadPersistentHistory();
@@ -57,7 +56,7 @@ int main(void) {
   rl_attempted_completion_function = myCompletion;
   signal(SIGCHLD, sigchldHandler);
   while (true) {
-    char* input = readline("myshell> ");
+    char *input = readline("myshell> ");
     if (!input) { // EOF (Ctrl+D)
       std::cout << "\n";
       break;
@@ -128,7 +127,7 @@ std::string trim(const std::string &s) {
 
 // Build history file path
 void initHistoryPath(void) {
-  const char* home = getenv("HOME");
+  const char *home = getenv("HOME");
   if (!home) home = ".";
   historyPath = std::string(home) + "/" + HISTORY_FILE;
 }
@@ -164,7 +163,6 @@ std::vector<char*> parseInput(std::string cmd) {
 }
 
 // Execute a single command with optional redirection
-// Execute a command
 void executeCommand(const std::string &cmd) {
   auto args = parseInput(cmd);
   if (args.size() <= 1) return;
@@ -197,7 +195,7 @@ void executeCommand(const std::string &cmd) {
 
 // Load all commands from PATH into commandList
 void loadSystemCommands(void) {
-  char* pathEnv = getenv("PATH");
+  char *pathEnv = getenv("PATH");
   if (!pathEnv) return;
 
   std::string pathCopy(pathEnv);
@@ -206,7 +204,7 @@ void loadSystemCommands(void) {
   while (std::getline(iss, dir, ':')) {
     DIR* dp = opendir(dir.c_str());
     if (dp) {
-      struct dirent* entry;
+      struct dirent *entry;
       while ((entry = readdir(dp)) != nullptr) {
         if (entry->d_type == DT_REG || entry->d_type == DT_LNK || entry->d_type == DT_UNKNOWN) {
           commandList.push_back(entry->d_name);
