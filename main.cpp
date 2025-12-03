@@ -189,6 +189,15 @@ int main(void) {
       bgJob(jobId);
       continue;
     }
+    // starts with cd
+    if (cmd2.rfind("cd", 0) == 0) {
+      std::string path = getenv("HOME") ? getenv("HOME") : "";
+      if (cmd2.size() > 2) {
+        path = cmd2.substr(3); // skip "cd "
+      }
+      std::filesystem::current_path(path);
+      continue;
+    }
     // Detect background execution
     bool background = false;
     if (!cmd2.empty() && cmd2.back() == '&') {
