@@ -63,7 +63,6 @@ int main(int argc, char *argv[]) {
       std::cout << "\n";
       break;
     }
-    input = trim(input);
     std::string cmd(trim(static_cast<std::string>(input)));
     free(input);
     if (cmd.empty()) continue;
