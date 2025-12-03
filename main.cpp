@@ -51,7 +51,7 @@ std::vector<std::string> historyList; // Command history
 std::string historyPath;
 
 
-int main(int argc, char *argv[]) {
+int main(void) {
   initHistoryPath();
   loadPersistentHistory();
   loadSystemCommands();
