@@ -68,6 +68,7 @@ bool isValidName(const std::string &str);
 std::string expandTile(const std::string &path);
 std::string toAbsolutePath(const std::string &path);
 std::string expandEnvVars(const std::string &path);
+std::vector<char *> splitArgs(const std::string &cmd);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -352,6 +353,19 @@ std::string trim(const std::string &s) {
     return args;
   }
 
+  std::vector<char *> splitArgs(const std::string &cmd) {
+    std::istringstream iss(cmd);
+    std::string token;
+    std::vector<char *> args;
+    while (iss >> token) {
+      char *arg = new char[token.size() + 1];
+      std::strcpy(arg, token.c_str());
+      args.push_back(arg);
+    }
+    args.push_back(nullptr);
+    return args;
+  }
+
   // Execute a single command with optional redirection
   void executeCommand(const std::string &cmd) {
     auto args = parseInput(cmd);
@@ -433,30 +447,30 @@ std::string trim(const std::string &s) {
 
   // Execute a pipeline of commands
   void executePipeline(std::vector<Command> &commands, bool background, const std::string &fullCmd) {
-  int numCmds = commands.size();
-  int pipefds[2 * (numCmds - 1)];
+    int numCmds = commands.size();
+    int pipefds[2 * (numCmds - 1)];
 
-  // Create pipes
-  for (int i = 0; i < numCmds - 1; i++) {
-    if (pipe(pipefds + i*2) < 0) {
-      perror("pipe");
-      return;
+    // Create pipes
+    for (int i = 0; i < numCmds - 1; i++) {
+      if (pipe(pipefds + i*2) < 0) {
+        perror("pipe");
+        return;
+      }
     }
-  }
 
-  pid_t pgid = 0;
-  for (int i = 0; i < numCmds; i++) {
-    pid_t pid = fork();
-    if (pid == 0) {
-      // Child process
-      if (pgid == 0) pgid = getpid();
-      setpgid(0, pgid);
-      // Redirect input from previous pipe
-      if (i > 0) dup2(pipefds[(i-1)*2], STDIN_FILENO);
-      // Redirect output to next pipe
-      if (i < numCmds - 1) dup2(pipefds[i*2 + 1], STDOUT_FILENO);
-      // Close all pipe fds
-      for (int j = 0; j < 2*(numCmds-1); j++) close(pipefds[j]);
+    pid_t pgid = 0;
+    for (int i = 0; i < numCmds; i++) {
+      pid_t pid = fork();
+      if (pid == 0) {
+        // Child process
+        if (pgid == 0) pgid = getpid();
+        setpgid(0, pgid);
+        // Redirect input from previous pipe
+        if (i > 0) dup2(pipefds[(i-1)*2], STDIN_FILENO);
+        // Redirect output to next pipe
+        if (i < numCmds - 1) dup2(pipefds[i*2 + 1], STDOUT_FILENO);
+        // Close all pipe fds
+        for (int j = 0; j < 2*(numCmds-1); j++) close(pipefds[j]);
         // Handle input redirection
         if (!commands[i].infile.empty()) {
           int fd = open(commands[i].infile.c_str(), O_RDONLY);
@@ -471,6 +485,8 @@ std::string trim(const std::string &s) {
           dup2(fd, STDOUT_FILENO);
           close(fd);
         }
+        std::string expanded = expandEnvVars(commands[i].args[0]);
+        std::vector<char *> args = splitArgs(expanded);
         // Execute command
         if (execvp(commands[i].args[0], commands[i].args.data()) == -1) {
           perror("execvp");
@@ -484,22 +500,22 @@ std::string trim(const std::string &s) {
       else {
         perror("fork");
       }
-  }
-  // Close all pipe fds in parent
-  for (int i = 0; i < 2*(numCmds-1); i++) close(pipefds[i]);
-  if (background) {
-    jobs[nextJobId] = {pgid, fullCmd, true};
-    std::cout << "[" << nextJobId << "] " << pgid << "\n";
-    nextJobId++;
-  } else {
-    tcsetpgrp(STDIN_FILENO, pgid);
-    int status;
-    waitpid(-pgid, &status, WUNTRACED);
-    tcsetpgrp(STDIN_FILENO, getpgrp());
-    if (WIFSTOPPED(status)) {
-      jobs[nextJobId] = {pgid, fullCmd, false};
-      std::cout << "[" << nextJobId << "] Stopped " << fullCmd << "\n";
-      nextJobId++;
     }
-  }
+    // Close all pipe fds in parent
+    for (int i = 0; i < 2*(numCmds-1); i++) close(pipefds[i]);
+    if (background) {
+      jobs[nextJobId] = {pgid, fullCmd, true};
+      std::cout << "[" << nextJobId << "] " << pgid << "\n";
+      nextJobId++;
+    } else {
+      tcsetpgrp(STDIN_FILENO, pgid);
+      int status;
+      waitpid(-pgid, &status, WUNTRACED);
+      tcsetpgrp(STDIN_FILENO, getpgrp());
+      if (WIFSTOPPED(status)) {
+        jobs[nextJobId] = {pgid, fullCmd, false};
+        std::cout << "[" << nextJobId << "] Stopped " << fullCmd << "\n";
+        nextJobId++;
+      }
+    }
 }
