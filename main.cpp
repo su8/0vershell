@@ -28,9 +28,11 @@
 #include <algorithm>
 #include <signal.h>
 #include <dirent.h>
+#include <map>
+#include <regex>
+#include <filesystem>
 #include <readline/readline.h>
 #include <readline/history.h>
-#include <map>
 
 struct Command {
   std::vector<char*> args;
@@ -61,6 +63,9 @@ char **myCompletion(const char *text, int start, int end);
 void executePipeline(std::vector<Command> &commands, bool background, const std::string &fullCmd);
 void freeArgs(std::vector<char*> &args);
 Command parseSingleCommand(const std::string &cmdStr);
+std::string expandTile(const std::string &path);
+std::string toAbsolutePath(const std::string &path);
+std::string expandEnvVars(const std::string &path);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -98,6 +103,9 @@ int main(void) {
       }
       continue;
     }
+    //cmd2 = expandTile(cmd2);
+    cmd2 = expandEnvVars(cmd2);
+    //cmd2 = toAbsolutePath(cmd2);
     // Built-in jobs
     if (cmd2 == "jobs") {
       listJobs();
@@ -145,6 +153,35 @@ int main(void) {
   }
   savePersistentHistory();
   return EXIT_SUCCESS;
+}
+
+std::string expandTile(const std::string &path) {
+  if (path.empty() || path[0] != '~') {
+    return path;
+  }
+  return (getenv("HOME") ? getenv("HOME") : "");
+}
+
+std::string expandEnvVars(const std::string &path) {
+  std::string result = path;
+  std::regex envPattern(R"(\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?)");
+  std::smatch match;
+  auto start = result.cbegin();
+  while (std::regex_search(start, result.cend(), match, envPattern)) {
+    const char *val = getenv(match[1].str().c_str());
+    std::string replacement = val ? val :"";
+    result.replace(match.position(0), match.length(0), replacement);
+    start = result.cbegin();
+  }
+  return result;
+}
+
+std::string toAbsolutePath(const std::string &path) {
+  try {
+    return std::filesystem::absolute(path).string();
+  } catch (const std::exception &e) {
+    throw std::runtime_error(std::string("Error: ") + e.what());
+  }
 }
 
 // Free allocated args
