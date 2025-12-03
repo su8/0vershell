@@ -28,7 +28,7 @@
 #include <algorithm>
 #include <signal.h>
 #include <dirent.h>
-#include <map>
+#include <unordered_map>
 #include <regex>
 #include <filesystem>
 #include <cctype>
@@ -48,7 +48,7 @@ struct Job {
   bool running;
 };
 
-std::map<int, Job> jobs;
+std::unordered_map<int, Job> jobs;
 int nextJobId = 1;
 
 std::string trim(const std::string &s);
@@ -69,6 +69,7 @@ std::string expandTile(const std::string &path);
 std::string toAbsolutePath(const std::string &path);
 std::string expandEnvVars(const std::string &path);
 std::vector<char *> splitArgs(const std::string &cmd);
+std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &aliases);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -86,7 +87,8 @@ int main(void) {
   rl_attempted_completion_function = myCompletion;
   signal(SIGCHLD, sigchldHandler);
   signal(SIGTTOU, SIG_IGN);
-  std::map<std::string, std::string> variables;
+  std::unordered_map<std::string, std::string> variables;
+  std::unordered_map<std::string, std::string> aliases;
   while (true) {
     char *input = readline("0vershell> ");
     if (!input) { // EOF (Ctrl+D)
@@ -106,6 +108,40 @@ int main(void) {
       }
       continue;
     }
+    // Handle alias creation: alias name="command"
+    if (cmd2.rfind("alias ", 0) == 0) {
+      std::string aliasDef = cmd2.substr(6);
+      size_t eqPos = aliasDef.find('=');
+      if (eqPos == std::string::npos) {
+        std::cerr << "Invalid alias format. Use: alias name=\"command\"\n";
+        continue;
+      }
+      std::string name = aliasDef.substr(0, eqPos);
+      std::string value = aliasDef.substr(eqPos + 1);
+      // Remove surrounding quotes if present
+      if (!value.empty() && value.front() == '"' && value.back() == '"') {
+        value = value.substr(1, value.size() - 2);
+      }
+      if (name.empty() || value.empty()) {
+        std::cerr << "Alias name and value cannot be empty.\n";
+        continue;
+      }
+      aliases[name] = value;
+      std::cout << "Alias set: " << name << " -> " << value << "\n";
+      continue;
+    }
+    // Handle unalias
+    if (cmd2.rfind("unalias ", 0) == 0) {
+      std::string name = cmd2.substr(8);
+      if (aliases.erase(name)) {
+        std::cout << "Alias removed: " << name << "\n";
+      } else {
+        std::cerr << "Alias not found: " << name << "\n";
+      }
+      continue;
+    }
+    // Expand alias if applicable
+    cmd2 = expandAlias(cmd2, aliases);
     // Variable retrieval
     if (cmd2[0] == '$') {
       std::string var = cmd2.substr(1);
@@ -302,6 +338,21 @@ void sigchldHandler(int) {
 
 // ======== Utility Functions ========
 
+// Expand alias if it exists
+std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &aliases) {
+  std::istringstream iss(input);
+  std::string firstWord;
+  iss >> firstWord;
+  auto it = aliases.find(firstWord);
+  if (it != aliases.end()) {
+    // Replace first word with alias value
+    std::string rest;
+    std::getline(iss, rest);
+    return it->second + rest;
+  }
+  return input;
+}
+
 // Check if string is valid variable name
 bool isValidName(const std::string &str) {
   if (str.empty() || std::isdigit(str[0])) {
@@ -317,8 +368,8 @@ bool isValidName(const std::string &str) {
 
 // Trim whitespace from both ends
 std::string trim(const std::string &s) {
-  size_t start = s.find_first_not_of(" \t");
-  size_t end = s.find_last_not_of(" \t");
+  size_t start = s.find_first_not_of(" \t\n\r");
+  size_t end = s.find_last_not_of(" \t\n\r");
   return (start == std::string::npos) ? "" : s.substr(start, end - start + 1); }
 
   // Build history file path
@@ -401,7 +452,6 @@ std::string trim(const std::string &s) {
   void loadSystemCommands(void) {
     char *pathEnv = getenv("PATH");
     if (!pathEnv) return;
-
     std::string pathCopy(pathEnv);
     std::istringstream iss(pathCopy);
     std::string dir;
@@ -449,7 +499,6 @@ std::string trim(const std::string &s) {
   void executePipeline(std::vector<Command> &commands, bool background, const std::string &fullCmd) {
     int numCmds = commands.size();
     int pipefds[2 * (numCmds - 1)];
-
     // Create pipes
     for (int i = 0; i < numCmds - 1; i++) {
       if (pipe(pipefds + i*2) < 0) {
@@ -457,7 +506,6 @@ std::string trim(const std::string &s) {
         return;
       }
     }
-
     pid_t pgid = 0;
     for (int i = 0; i < numCmds; i++) {
       pid_t pid = fork();
