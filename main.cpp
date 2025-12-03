@@ -31,6 +31,7 @@
 #include <map>
 #include <regex>
 #include <filesystem>
+#include <cctype>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -63,6 +64,7 @@ char **myCompletion(const char *text, int start, int end);
 void executePipeline(std::vector<Command> &commands, bool background, const std::string &fullCmd);
 void freeArgs(std::vector<char*> &args);
 Command parseSingleCommand(const std::string &cmdStr);
+bool isValidName(const std::string &str);
 std::string expandTile(const std::string &path);
 std::string toAbsolutePath(const std::string &path);
 std::string expandEnvVars(const std::string &path);
@@ -83,7 +85,7 @@ int main(void) {
   rl_attempted_completion_function = myCompletion;
   signal(SIGCHLD, sigchldHandler);
   signal(SIGTTOU, SIG_IGN);
-
+  std::map<std::string, std::string> variables;
   while (true) {
     char *input = readline("0vershell> ");
     if (!input) { // EOF (Ctrl+D)
@@ -103,9 +105,30 @@ int main(void) {
       }
       continue;
     }
-    //cmd2 = expandTile(cmd2);
+    // Variable retrieval
+    if (cmd2[0] == '$') {
+      std::string var = cmd2.substr(1);
+      for (const auto &[key, val] : variables) {
+        if (key == var) {
+          std::cout << val << std::endl;
+          break;
+        }
+      }
+      continue;
+    }
+    // Variable assignment
+    size_t eqPos = cmd2.find('=');
+    if (eqPos != std::string::npos) {
+      std::string name = cmd2.substr(0, eqPos);
+      std::string value = cmd2.substr(eqPos + 1);
+      if (!isValidName(name)) {
+        std::cout << "Invalid variable name: " << name << "\n";
+        continue;
+      }
+      variables[name] = value;
+      continue;
+    }
     cmd2 = expandEnvVars(cmd2);
-    //cmd2 = toAbsolutePath(cmd2);
     // Built-in jobs
     if (cmd2 == "jobs") {
       listJobs();
@@ -272,6 +295,19 @@ void sigchldHandler(int) {
 }
 
 // ======== Utility Functions ========
+
+// Check if string is valid variable name
+bool isValidName(const std::string &str) {
+  if (str.empty() || std::isdigit(str[0])) {
+    return false;
+  }
+  for (char ch : str) {
+    if (!std::isalnum(ch) && ch != '_') {
+      return false;
+    }
+  }
+  return true;
+}
 
 // Trim whitespace from both ends
 std::string trim(const std::string &s) {
