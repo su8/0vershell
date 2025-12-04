@@ -322,11 +322,11 @@ Command parseSingleCommand(const std::string &cmdStr) {
 
 // List jobs
 void listJobs() {
-  for (auto &j : jobs) {
-    std::cout << "[" << j.first << "] "
-    << (j.second.running ? "Running" : "Stopped")
-    << " " << j.second.command
-    << " (PGID " << j.second.pgid << ")\n";
+  for (const auto &[key, val]: jobs) {
+    std::cout << "[" << key << "] "
+    << (val.running ? "Running" : "Stopped")
+    << " " << val.command
+    << " (PGID " << val.pgid << ")\n";
   }
 }
 
