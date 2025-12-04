@@ -69,8 +69,9 @@ std::string expandTile(const std::string &path);
 std::string toAbsolutePath(const std::string &path);
 std::string expandEnvVars(const std::string &path);
 std::vector<char *> splitArgs(const std::string &cmd);
-std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &aliases);
-std::string doEcho( const std::string &input, const std::unordered_map<std::string, std::string> &vars);
+std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &alias);
+void doAlias(const std::string &cmd2);
+std::string doEcho(const std::string &input, const std::unordered_map<std::string, std::string> &vars);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -78,6 +79,7 @@ void bgJob(int jobId);
 std::vector<std::string> commandList;
 std::vector<std::string> historyList; // Command history
 std::string historyPath;
+std::unordered_map<std::string, std::string> aliases;
 
 int main(void) {
   initHistoryPath();
@@ -87,7 +89,6 @@ int main(void) {
   signal(SIGCHLD, sigchldHandler);
   signal(SIGTTOU, SIG_IGN);
   std::unordered_map<std::string, std::string> variables;
-  std::unordered_map<std::string, std::string> aliases;
   while (true) {
     char *input = readline("0vershell> ");
     if (!input) { // EOF (Ctrl+D)
@@ -109,24 +110,7 @@ int main(void) {
     }
     // Handle alias creation: alias name="command"
     if (cmd2.rfind("alias ", 0) == 0) {
-      std::string aliasDef = cmd2.substr(6);
-      size_t eqPos = aliasDef.find('=');
-      if (eqPos == std::string::npos) {
-        std::cerr << "Invalid alias format. Use: alias name=\"command\"\n";
-        continue;
-      }
-      std::string name = aliasDef.substr(0, eqPos);
-      std::string value = aliasDef.substr(eqPos + 1);
-      // Remove surrounding quotes if present
-      if (!value.empty() && value.front() == '"' && value.back() == '"') {
-        value = value.substr(1, value.size() - 2);
-      }
-      if (name.empty() || value.empty()) {
-        std::cerr << "Alias name and value cannot be empty.\n";
-        continue;
-      }
-      aliases[name] = value;
-      std::cout << "Alias set: " << name << " -> " << value << "\n";
+      doAlias(cmd2);
       continue;
     }
     // Handle unalias
@@ -227,8 +211,30 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
+// Setup alias
+void doAlias(const std::string &cmd2) {
+  std::string aliasDef = cmd2.substr(6);
+  size_t eqPos = aliasDef.find('=');
+  if (eqPos == std::string::npos) {
+    std::cerr << "Invalid alias format. Use: alias name=\"command\"\n";
+    return;
+  }
+  std::string name = aliasDef.substr(0, eqPos);
+  std::string value = aliasDef.substr(eqPos + 1);
+  // Remove surrounding quotes if present
+  if (!value.empty() && value.front() == '"' && value.back() == '"') {
+    value = value.substr(1, value.size() - 2);
+  }
+  if (name.empty() || value.empty()) {
+    std::cerr << "Alias name and value cannot be empty.\n";
+    return;
+  }
+  aliases[name] = value;
+  std::cout << "Alias set: " << name << " -> " << value << "\n";
+}
+
 // Function to replace variables in the input string based on a regex pattern and a map
-std::string doEcho( const std::string &input, const std::unordered_map<std::string, std::string> &vars) {
+std::string doEcho(const std::string &input, const std::unordered_map<std::string, std::string> &vars) {
   //std::regex varPattern(R"(\$\{(\w+)\})"); // matches ${var}
   std::regex varPattern(R"(\$([A-Za-z_][A-Za-z0-9_]*))");
   std::string result;
@@ -254,7 +260,6 @@ std::string doEcho( const std::string &input, const std::unordered_map<std::stri
   result.append(input, lastPos, std::string::npos);
   return result;
 }
-
 
 std::string expandTile(const std::string &path) {
   if (path.empty() || path[0] != '~') {
@@ -379,12 +384,12 @@ void sigchldHandler(int) {
 // ======== Utility Functions ========
 
 // Expand alias if it exists
-std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &aliases) {
+std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &alias) {
   std::istringstream iss(input);
   std::string firstWord;
   iss >> firstWord;
-  auto it = aliases.find(firstWord);
-  if (it != aliases.end()) {
+  auto it = alias.find(firstWord);
+  if (it != alias.end()) {
     // Replace first word with alias value
     std::string rest;
     std::getline(iss, rest);
