@@ -71,7 +71,8 @@ std::string expandEnvVars(const std::string &path);
 std::vector<char *> splitArgs(const std::string &cmd);
 std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &alias);
 void doAlias(const std::string &cmd2);
-std::string doEcho(const std::string &input, const std::unordered_map<std::string, std::string> &vars);
+std::string doPrint(const std::string &input, const std::unordered_map<std::string, std::string> &vars);
+void doVarAssign(const std::string &cmd2, size_t eqPos);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -80,6 +81,7 @@ std::vector<std::string> commandList;
 std::vector<std::string> historyList; // Command history
 std::string historyPath;
 std::unordered_map<std::string, std::string> aliases;
+std::unordered_map<std::string, std::string> variables;
 
 int main(void) {
   initHistoryPath();
@@ -88,7 +90,6 @@ int main(void) {
   rl_attempted_completion_function = myCompletion;
   signal(SIGCHLD, sigchldHandler);
   signal(SIGTTOU, SIG_IGN);
-  std::unordered_map<std::string, std::string> variables;
   while (true) {
     char *input = readline("0vershell> ");
     if (!input) { // EOF (Ctrl+D)
@@ -139,26 +140,11 @@ int main(void) {
     // Variable assignment
     size_t eqPos = cmd2.find('=');
     if (eqPos != std::string::npos) {
-      std::string name = cmd2.substr(0, eqPos);
-      std::string value = cmd2.substr(eqPos + 1);
-      if (value.rfind('$', 0) == 0) {
-        std::string str = value.substr(1);
-        for (const auto &[key, val] : variables) {
-          if (key == str) {
-            variables[name] = val;
-            break;
-          }
-        }
-      }
-      if (!isValidName(name)) {
-        std::cout << "Invalid variable name: " << name << "\n";
-        continue;
-      }
-      variables[name] = value;
+      doVarAssign(cmd2, eqPos);
       continue;
     }
-    if (cmd2.rfind("echo", 0) == 0) {
-      std::cout << doEcho(cmd2.substr(5), variables) << std::endl;
+    if (cmd2.rfind("print", 0) == 0) {
+      std::cout << doPrint(cmd2.substr(5), variables) << std::endl;
       continue;
     }
     cmd2 = expandEnvVars(cmd2);
@@ -215,6 +201,30 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
+// Variable assignment and if we assign it to another variable, then expand it
+void doVarAssign(const std::string &cmd2, size_t eqPos) {
+  std::string name = cmd2.substr(0, eqPos);
+  std::string value = cmd2.substr(eqPos + 1);
+  unsigned int foundIt = 0U;
+  if (value.rfind('$', 0) == 0) {
+    std::string str = value.substr(1);
+    for (const auto &[key, val] : variables) {
+      if (key == str) {
+        variables[name] = val;
+        foundIt = 1U;
+        break;
+      }
+    }
+  }
+  if (!isValidName(name)) {
+    std::cout << "Invalid variable name: " << name << "\n";
+    return;
+  }
+  if (foundIt == 0U) {
+    variables[name] = value;
+  }
+}
+
 // Setup alias
 void doAlias(const std::string &cmd2) {
   std::string aliasDef = cmd2.substr(6);
@@ -238,7 +248,7 @@ void doAlias(const std::string &cmd2) {
 }
 
 // Function to replace variables in the input string based on a regex pattern and a map
-std::string doEcho(const std::string &input, const std::unordered_map<std::string, std::string> &vars) {
+std::string doPrint(const std::string &input, const std::unordered_map<std::string, std::string> &vars) {
   //std::regex varPattern(R"(\$\{(\w+)\})"); // matches ${var}
   std::regex varPattern(R"(\$([A-Za-z_][A-Za-z0-9_]*))");
   std::string result;

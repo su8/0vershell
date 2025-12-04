@@ -14,6 +14,12 @@ In Debian it's `libreadline-dev`, in your other OS's search for `readline`. It's
 
 ---
 
+### Notes:
+
+To print the variables (a.k.a to expand them) you should use `print $myVar` and not `echo $myVar`.
+
+---
+
 ### To do:
 
 1. Parse `while` / `for` loops.
