@@ -141,6 +141,15 @@ int main(void) {
     if (eqPos != std::string::npos) {
       std::string name = cmd2.substr(0, eqPos);
       std::string value = cmd2.substr(eqPos + 1);
+      if (value.rfind('$', 0) == 0) {
+        std::string str = value.substr(1);
+        for (const auto &[key, val] : variables) {
+          if (key == str) {
+            variables[name] = val;
+            break;
+          }
+        }
+      }
       if (!isValidName(name)) {
         std::cout << "Invalid variable name: " << name << "\n";
         continue;
