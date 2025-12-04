@@ -158,21 +158,16 @@ int main(void) {
       listJobs();
       continue;
     }
-    // Built-in fg
-    if (cmd2.rfind("fg", 0) == 0) {
+    // Built-in fg or bg
+    if (cmd2.rfind("fg", 0) == 0 || cmd2.rfind("bg", 0) == 0) {
       std::istringstream iss(cmd2);
       std::string cmd;
       int jobId;
       iss >> cmd >> jobId;
-      fgJob(jobId);
-      continue;
-    }
-    // Built-in bg
-    if (cmd2.rfind("bg", 0) == 0) {
-      std::istringstream iss(cmd2);
-      std::string cmd;
-      int jobId;
-      iss >> cmd >> jobId;
+      if (cmd2.rfind("fg", 0) == 0) {
+        fgJob(jobId);
+        continue;
+      }
       bgJob(jobId);
       continue;
     }
