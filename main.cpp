@@ -69,10 +69,11 @@ std::string expandTile(const std::string &path);
 std::string toAbsolutePath(const std::string &path);
 std::string expandEnvVars(const std::string &path);
 std::vector<char *> splitArgs(const std::string &cmd);
-std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &alias);
+std::string expandAlias(const std::string &input);
 void doAlias(const std::string &cmd2);
-std::string doPrint(const std::string &input, const std::unordered_map<std::string, std::string> &vars);
+std::string doPrint(const std::string &input);
 void doVarAssign(const std::string &cmd2, size_t eqPos);
+void doAssignAlias(const std::string &cmd2);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -112,6 +113,7 @@ int main(void) {
     // Handle alias creation: alias name="command"
     if (cmd2.rfind("alias ", 0) == 0) {
       doAlias(cmd2);
+      doAssignAlias(cmd2);
       continue;
     }
     // Handle unalias
@@ -125,7 +127,7 @@ int main(void) {
       continue;
     }
     // Expand alias if applicable
-    cmd2 = expandAlias(cmd2, aliases);
+    cmd2 = expandAlias(cmd2);
     // Variable retrieval
     if (cmd2[0] == '$') {
       std::string var = cmd2.substr(1);
@@ -144,7 +146,7 @@ int main(void) {
       continue;
     }
     if (cmd2.rfind("print", 0) == 0) {
-      std::cout << doPrint(cmd2.substr(5), variables) << std::endl;
+      std::cout << doPrint(cmd2.substr(5)) << std::endl;
       continue;
     }
     cmd2 = expandEnvVars(cmd2);
@@ -201,11 +203,47 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
+// Alias to inherit data from other variable, e.g: alias l=$myVar
+void doAssignAlias(const std::string &cmd2) {
+  std::string aliasDef = cmd2.substr(6);
+  size_t eqPos = aliasDef.find('=');
+  unsigned int foundIt = 0U;
+  if (eqPos == std::string::npos) {
+    std::cerr << "Invalid alias format. Use: alias name=\"command\"\n";
+    return;
+  }
+  std::string name = aliasDef.substr(0, eqPos);
+  std::string value = aliasDef.substr(eqPos + 2);
+  // Remove surrounding quotes if present
+  if (!value.empty() && value.front() == '"' && value.back() == '"') {
+    value = value.substr(1, value.size() - 2);
+  }
+  if (name.empty() || value.empty()) {
+    std::cerr << "Alias name and value cannot be empty.\n";
+    return;
+  }
+  for (const auto &[key, val] : variables) {
+    if (key == value) {
+      aliases[name] = val;
+      foundIt = 1U;
+      break;
+    }
+  }
+  if (foundIt == 0U) {
+    for (const auto &[key, val] : aliases) {
+      if (key == value) {
+        aliases[name] = val;
+        break;
+      }
+    }
+  }
+}
+
 // Variable assignment and if we assign it to another variable, then expand it
 void doVarAssign(const std::string &cmd2, size_t eqPos) {
+  unsigned int foundIt = 0U;
   std::string name = cmd2.substr(0, eqPos);
   std::string value = cmd2.substr(eqPos + 1);
-  unsigned int foundIt = 0U;
   if (value.rfind('$', 0) == 0) {
     std::string str = value.substr(1);
     for (const auto &[key, val] : variables) {
@@ -248,7 +286,7 @@ void doAlias(const std::string &cmd2) {
 }
 
 // Function to replace variables in the input string based on a regex pattern and a map
-std::string doPrint(const std::string &input, const std::unordered_map<std::string, std::string> &vars) {
+std::string doPrint(const std::string &input) {
   //std::regex varPattern(R"(\$\{(\w+)\})"); // matches ${var}
   std::regex varPattern(R"(\$([A-Za-z_][A-Za-z0-9_]*))");
   std::string result;
@@ -262,8 +300,8 @@ std::string doPrint(const std::string &input, const std::unordered_map<std::stri
     // Extract variable name from capture group 1
     std::string varName = match[1].str();
     // Replace with value from map if found, else empty string
-    auto it = vars.find(varName);
-    if (it != vars.end()) {
+    auto it = variables.find(varName);
+    if (it != variables.end()) {
       result.append(it->second);
     }
     // Update last position
@@ -398,12 +436,12 @@ void sigchldHandler(int) {
 // ======== Utility Functions ========
 
 // Expand alias if it exists
-std::string expandAlias(const std::string &input, const std::unordered_map<std::string, std::string> &alias) {
+std::string expandAlias(const std::string &input) {
   std::istringstream iss(input);
   std::string firstWord;
   iss >> firstWord;
-  auto it = alias.find(firstWord);
-  if (it != alias.end()) {
+  auto it = aliases.find(firstWord);
+  if (it != aliases.end()) {
     // Replace first word with alias value
     std::string rest;
     std::getline(iss, rest);
@@ -625,4 +663,4 @@ std::string trim(const std::string &s) {
         nextJobId++;
       }
     }
-}
+  }
