@@ -73,7 +73,7 @@ std::string expandAlias(const std::string &input);
 void doAlias(const std::string &cmd2);
 std::string doPrint(const std::string &input);
 void doVarAssign(const std::string &cmd2, size_t eqPos);
-void doAssignAlias(const std::string &cmd2);
+void doExpandAlias(const std::string &cmd2);
 void listJobs(void);
 void fgJob(int jobId);
 void bgJob(int jobId);
@@ -113,7 +113,7 @@ int main(void) {
     // Handle alias creation: alias name="command"
     if (cmd2.rfind("alias ", 0) == 0) {
       doAlias(cmd2);
-      doAssignAlias(cmd2);
+      doExpandAlias(cmd2);
       continue;
     }
     // Handle unalias
@@ -204,24 +204,17 @@ int main(void) {
 }
 
 // Alias to inherit data from other variable, e.g: alias l=$myVar
-void doAssignAlias(const std::string &cmd2) {
+void doExpandAlias(const std::string &cmd2) {
   std::string aliasDef = cmd2.substr(6);
   size_t eqPos = aliasDef.find('=');
   unsigned int foundIt = 0U;
-  if (eqPos == std::string::npos) {
-    std::cerr << "Invalid alias format. Use: alias name=\"command\"\n";
-    return;
-  }
+  if (eqPos == std::string::npos) { std::cerr << "Invalid alias format. Use: alias name=\"command\"\n"; return; }
+  //if (cmd2.rfind('$', 0) != 0) { return; }
   std::string name = aliasDef.substr(0, eqPos);
   std::string value = aliasDef.substr(eqPos + 2);
   // Remove surrounding quotes if present
-  if (!value.empty() && value.front() == '"' && value.back() == '"') {
-    value = value.substr(1, value.size() - 2);
-  }
-  if (name.empty() || value.empty()) {
-    std::cerr << "Alias name and value cannot be empty.\n";
-    return;
-  }
+  if (!value.empty() && value.front() == '"' && value.back() == '"') { value = value.substr(1, value.size() - 2); }
+  if (name.empty() || value.empty()) { std::cerr << "Alias name and value cannot be empty.\n"; return; }
   for (const auto &[key, val] : variables) {
     if (key == value) {
       aliases[name] = val;
