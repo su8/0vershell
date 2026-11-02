@@ -23,6 +23,10 @@
  *                        syntax) and is put in the line at the end, where it was
  *   3. the expansions    quotes, $var ${var} $? $$, ~, word splitting, * ? [ ]
  *   4. the command       builtin, or fork and exec, with pipes and redirections
+ *
+ * Compound commands (for / while / until) are recognised at list level, before step 1 of
+ * their bodies, and their bodies / conditions are fed back through the same pipeline.
+ *
  * There is no print command: write  echo $var  as in every shell.
  */
 
@@ -58,15 +62,14 @@ extern char **environ;
 enum RedirectKind { R_IN, R_OUT, R_APPEND, R_DUP };
 
 struct Redirect {
-  int fd;                  // the descriptor that is redirected
+  int fd;
   RedirectKind kind;
-  std::string path;        // the file
-  int dupFd;               // 2>&1: the descriptor to copy
+  std::string path;
+  int dupFd;
 };
 
-// One command of a pipeline
 struct Stage {
-  std::vector<std::pair<std::string, std::string> > assigns; // NAME=value in front of the command
+  std::vector<std::pair<std::string, std::string> > assigns;
   std::vector<std::string> argv;
   std::vector<Redirect> redirs;
   bool empty() const { return assigns.empty() && argv.empty() && redirs.empty(); }
@@ -76,12 +79,28 @@ struct Job {
   pid_t pgid;
   std::string command;
   bool running;
-  std::vector<pid_t> pids; // the processes of the pipeline that are not finished
+  std::vector<pid_t> pids;
+};
+
+// A for / while / until compound command found in a line
+struct Compound {
+  size_t begin;
+  size_t end;
+  std::string keyword;      // "for", "while", "until"
+  std::string var;          // for: loop variable
+  std::string itemsText;    // for: raw text after `in`, or "" for `for x; do`
+  bool haveIn;
+  std::string cond;         // while/until: the condition text
+  std::string body;
+  Compound() : begin(0), end(0), haveIn(false) {}
 };
 
 struct ListItem {
   std::string text;
-  char op;                 // what follows: ';' '&' (background) 'a' (&&) 'o' (||) '\0' (the end)
+  char op;
+  bool isCompound;
+  Compound compound;
+  ListItem() : op(0), isCompound(false) {}
 };
 
 static std::map<int, Job> jobs;
@@ -89,14 +108,20 @@ static int nextJobId = 1;
 static std::vector<std::string> commandList;
 static std::string historyPath;
 static std::unordered_map<std::string, std::string> aliases;
-static std::unordered_map<std::string, std::string> variables; // shell variables, the environment is read after them
-static bool gInteractive = false;  // a terminal: job control
-static bool gSubshell = false;     // the child that runs a $(command)
+static std::unordered_map<std::string, std::string> variables;
+static bool gInteractive = false;
+static bool gSubshell = false;
 static bool gExit = false;
 static int gExitCode = 0;
 static int gLastStatus = 0;
 static int gSubstDepth = 0;
 static pid_t gShellPgid = 0;
+static pid_t gShellPid = 0;        // the pid `$$` returns, even inside a subshell
+
+// Loop state
+static int gLoopDepth = 0;
+static int gBreakLevel = 0;        // break N
+static int gContinueLevel = 0;     // continue N
 
 static void runLine(const std::string &line);
 
@@ -127,10 +152,9 @@ static void flushOutput() {
   std::fflush(NULL);
 }
 
-// The value of a variable: a shell variable first, then the environment, else empty
 static std::string lookupVar(const std::string &name) {
   if (name == "?") { return std::to_string(gLastStatus); }
-  if (name == "$") { return std::to_string(static_cast<long>(getpid())); }
+  if (name == "$") { return std::to_string(static_cast<long>(gShellPid)); }
   if (name == "0") { return "0vershell"; }
   std::unordered_map<std::string, std::string>::const_iterator it = variables.find(name);
   if (it != variables.end()) { return it->second; }
@@ -138,20 +162,18 @@ static std::string lookupVar(const std::string &name) {
   return env ? env : "";
 }
 
-// A variable that was exported keeps the environment in step
 static void setVariable(const std::string &name, const std::string &value) {
   variables[name] = value;
   if (std::getenv(name.c_str())) { setenv(name.c_str(), value.c_str(), 1); }
 }
 
 // ---------------------------------------------------------------------------
-// Finding the end of quotes and of $( ) and ` `, they are used by every phase
+// Quote / $( ) / ` ` matching (used by every phase)
 // ---------------------------------------------------------------------------
 
 static size_t matchParen(const std::string &t, size_t open);
 static size_t skipDouble(const std::string &t, size_t i);
 
-// t[i] is a backtick: the index of the one that closes it
 static size_t matchBacktick(const std::string &t, size_t i) {
   for (size_t j = i + 1; j < t.size(); j++) {
     if (t[j] == '\\') { j++; continue; }
@@ -160,7 +182,6 @@ static size_t matchBacktick(const std::string &t, size_t i) {
   return std::string::npos;
 }
 
-// t[open] is the ( of a $( ): the index of the ) that closes it, quotes and nested $( ) are skipped
 static size_t matchParen(const std::string &t, size_t open) {
   int depth = 0;
   for (size_t i = open; i < t.size(); i++) {
@@ -175,7 +196,6 @@ static size_t matchParen(const std::string &t, size_t open) {
   return std::string::npos;
 }
 
-// t[i] is a double quote: the index of the one that closes it
 static size_t skipDouble(const std::string &t, size_t i) {
   for (size_t j = i + 1; j < t.size(); j++) {
     const char c = t[j];
@@ -188,7 +208,138 @@ static size_t skipDouble(const std::string &t, size_t i) {
 }
 
 // ---------------------------------------------------------------------------
-// The line is cut into commands at ; & && ||  (not in quotes, not inside $( ) or ` `)
+// Compound commands (for / while / until) — parsing helpers
+// ---------------------------------------------------------------------------
+
+static bool wordAt(const std::string &t, size_t pos, const char *word) {
+  const size_t n = std::strlen(word);
+  if (t.compare(pos, n, word) != 0) { return false; }
+  const size_t e = pos + n;
+  return e >= t.size() || !isNameChar(t[e]);
+}
+
+static size_t skipSpace(const std::string &t, size_t i) {
+  while (i < t.size() && isBlank(t[i])) { i++; }
+  return i;
+}
+
+static bool atCommandBoundary(const std::string &t, size_t p, size_t floor) {
+  size_t q = p;
+  while (q > floor && isBlank(t[q - 1])) { q--; }
+  if (q == floor || q == 0) { return true; }
+  const char b = t[q - 1];
+  return b == ';' || b == '\n' || b == '(' || b == '{' || b == '|' || b == '&';
+}
+
+static size_t findKeyword(const std::string &t, size_t from, const char *word) {
+  for (size_t k = from; k < t.size();) {
+    const char ch = t[k];
+    if (ch == '\\') { k += 2; continue; }
+    if (ch == '\'') { const size_t e = t.find('\'', k + 1); if (e == std::string::npos) { return std::string::npos; } k = e + 1; continue; }
+    if (ch == '"')  { const size_t e = skipDouble(t, k);    if (e == std::string::npos) { return std::string::npos; } k = e + 1; continue; }
+    if (ch == '`')  { const size_t e = matchBacktick(t, k); if (e == std::string::npos) { return std::string::npos; } k = e + 1; continue; }
+    if (ch == '$' && k + 1 < t.size() && t[k + 1] == '(') {
+      const size_t e = matchParen(t, k + 1);
+      if (e == std::string::npos) { return std::string::npos; }
+      k = e + 1; continue;
+    }
+    if (isNameStart(ch) && wordAt(t, k, word) && atCommandBoundary(t, k, from)) { return k; }
+    k++;
+  }
+  return std::string::npos;
+}
+
+static bool parseCompoundAt(const std::string &t, size_t i, Compound &c, std::string &error);
+
+static size_t matchDone(const std::string &t, size_t from, std::string &error) {
+  int depth = 1;
+  size_t p = from;
+  while (p < t.size()) {
+    const char ch = t[p];
+    if (ch == '\\') { p += 2; continue; }
+    if (ch == '\'') { const size_t e = t.find('\'', p + 1); if (e == std::string::npos) { error = "syntax error: unterminated single quote"; return std::string::npos; } p = e + 1; continue; }
+    if (ch == '"')  { const size_t e = skipDouble(t, p);    if (e == std::string::npos) { error = "syntax error: unterminated double quote"; return std::string::npos; } p = e + 1; continue; }
+    if (ch == '`')  { const size_t e = matchBacktick(t, p); if (e == std::string::npos) { error = "syntax error: unterminated backtick"; return std::string::npos; } p = e + 1; continue; }
+    if (ch == '$' && p + 1 < t.size() && t[p + 1] == '(') {
+      const size_t e = matchParen(t, p + 1);
+      if (e == std::string::npos) { error = "syntax error: unterminated $("; return std::string::npos; }
+      p = e + 1; continue;
+    }
+    if (isNameStart(ch) && atCommandBoundary(t, p, from)) {
+      if (wordAt(t, p, "for") || wordAt(t, p, "while") || wordAt(t, p, "until")) {
+        Compound inner;
+        if (!parseCompoundAt(t, p, inner, error)) { return std::string::npos; }
+        p = inner.end;
+        continue;
+      }
+      if (wordAt(t, p, "done")) {
+        if (--depth == 0) { return p; }
+        p += 4; continue;
+      }
+      if (wordAt(t, p, "do")) { p += 2; continue; }
+    }
+    p++;
+  }
+  error = "syntax error: done not found";
+  return std::string::npos;
+}
+
+static void stripTrailingSemicolon(std::string &s) {
+  while (!s.empty()) {
+    const char c = s[s.size() - 1];
+    if (c == ';' || isBlank(c)) { s.erase(s.size() - 1); } else { break; }
+  }
+}
+
+static bool parseCompoundAt(const std::string &t, size_t i, Compound &c, std::string &error) {
+  c.begin = i;
+  if (wordAt(t, i, "for")) {
+    c.keyword = "for";
+    size_t k = skipSpace(t, i + 3);
+    if (k >= t.size() || !isNameStart(t[k])) { error = "syntax error: for: a variable name is needed"; return false; }
+    size_t v = k;
+    while (v < t.size() && isNameChar(t[v])) { v++; }
+    c.var = t.substr(k, v - k);
+    k = skipSpace(t, v);
+    c.haveIn = false;
+    if (k < t.size() && wordAt(t, k, "in")) {
+      c.haveIn = true;
+      k = skipSpace(t, k + 2);
+    }
+    const size_t doPos = findKeyword(t, k, "do");
+    if (doPos == std::string::npos) { error = "syntax error: for: do not found"; return false; }
+    if (c.haveIn) {
+      c.itemsText = trim(t.substr(k, doPos - k));
+      stripTrailingSemicolon(c.itemsText);
+    }
+    const size_t afterDo = skipSpace(t, doPos + 2);
+    std::string dummy;
+    const size_t donePos = matchDone(t, afterDo, dummy);
+    if (donePos == std::string::npos) { error = "syntax error: for: done not found"; return false; }
+    c.body = t.substr(afterDo, donePos - afterDo);
+    c.end = donePos + 4;
+    return true;
+  }
+  const bool isWhile = wordAt(t, i, "while");
+  const char *kw = isWhile ? "while" : "until";
+  c.keyword = kw;
+  const size_t k = i + std::strlen(kw);
+  const size_t doPos = findKeyword(t, k, "do");
+  if (doPos == std::string::npos) { error = std::string("syntax error: ") + c.keyword + ": do not found"; return false; }
+  c.cond = trim(t.substr(k, doPos - k));
+  stripTrailingSemicolon(c.cond);
+  const size_t afterDo = skipSpace(t, doPos + 2);
+  std::string dummy;
+  const size_t donePos = matchDone(t, afterDo, dummy);
+  if (donePos == std::string::npos) { error = std::string("syntax error: ") + c.keyword + ": done not found"; return false; }
+  c.body = t.substr(afterDo, donePos - afterDo);
+  c.end = donePos + 4;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// The line is cut into commands at ; & && ||  (not in quotes, not inside $( ) or ` `).
+// A compound at a command boundary is kept whole in a single ListItem.
 // ---------------------------------------------------------------------------
 
 static bool splitList(const std::string &s, std::vector<ListItem> &items, std::string &error) {
@@ -196,6 +347,34 @@ static bool splitList(const std::string &s, std::vector<ListItem> &items, std::s
   size_t i = 0;
   const size_t n = s.size();
   while (i < n) {
+    // A compound command begins here (at the start of the current item, after trimming)?
+    if (trim(cur).empty() && i < n && isNameStart(s[i]) &&
+        (wordAt(s, i, "for") || wordAt(s, i, "while") || wordAt(s, i, "until")) &&
+        atCommandBoundary(s, i, 0)) {
+      Compound c;
+      if (!parseCompoundAt(s, i, c, error)) { return false; }
+      ListItem item;
+      item.text = s.substr(i, c.end - i);
+      item.isCompound = true;
+      item.compound = c;
+      i = c.end;
+      while (i < n && isBlank(s[i])) { i++; }
+      char op = 0;
+      size_t used = 1;
+      if (i < n) {
+        const char ch = s[i];
+        if (ch == ';') { op = ';'; }
+        else if (ch == '&' && i + 1 < n && s[i + 1] == '&') { op = 'a'; used = 2; }
+        else if (ch == '&') { op = '&'; }
+        else if (ch == '|' && i + 1 < n && s[i + 1] == '|') { op = 'o'; used = 2; }
+        else { error = std::string("syntax error near '") + ch + "' after done"; return false; }
+        i += used;
+      }
+      item.op = op;
+      items.push_back(item);
+      continue;
+    }
+
     const char c = s[i];
     char op = 0;
     size_t used = 1;
@@ -220,10 +399,10 @@ static bool splitList(const std::string &s, std::vector<ListItem> &items, std::s
       if (e == std::string::npos) { error = "syntax error: unterminated $("; return false; }
       cur.append(s, i, e - i + 1); i = e + 1; continue;
     }
-    if (c == '#' && (cur.empty() || isBlank(cur[cur.size() - 1]))) { break; } // a comment
+    if (c == '#' && (cur.empty() || isBlank(cur[cur.size() - 1]))) { break; }
     if (c == ';') { op = ';'; }
     else if (c == '&' && i + 1 < n && s[i + 1] == '&') { op = 'a'; used = 2; }
-    else if (c == '&' && !cur.empty() && (cur[cur.size() - 1] == '>' || cur[cur.size() - 1] == '<')) { cur += c; i++; continue; } // 2>&1
+    else if (c == '&' && !cur.empty() && (cur[cur.size() - 1] == '>' || cur[cur.size() - 1] == '<')) { cur += c; i++; continue; }
     else if (c == '&') { op = '&'; }
     else if (c == '|' && i + 1 < n && s[i + 1] == '|') { op = 'o'; used = 2; }
     if (!op) { cur += c; i++; continue; }
@@ -248,10 +427,9 @@ static bool splitList(const std::string &s, std::vector<ListItem> &items, std::s
 }
 
 // ---------------------------------------------------------------------------
-// 1. Aliases: the first word of every command of a pipeline, before anything else is expanded
+// 1. Aliases
 // ---------------------------------------------------------------------------
 
-// The index of the next | that is not in quotes or in $( ), or npos
 static size_t nextPipe(const std::string &t, size_t from) {
   for (size_t i = from; i < t.size(); i++) {
     const char c = t[i];
@@ -269,7 +447,7 @@ static std::string expandAliases(const std::string &input) {
   if (aliases.empty()) { return input; }
   std::string t = input;
   size_t pos = 0;
-  std::set<std::string> seen; // an alias is expanded once for a command, "alias ls='ls --color'" does not loop
+  std::set<std::string> seen;
   while (pos < t.size()) {
     while (pos < t.size() && isBlank(t[pos])) { pos++; }
     size_t end = pos;
@@ -280,7 +458,7 @@ static std::string expandAliases(const std::string &input) {
       std::unordered_map<std::string, std::string>::const_iterator it = aliases.find(word);
       if (it != aliases.end() && !seen.count(word)) {
         seen.insert(word);
-        t.replace(pos, end - pos, it->second); // and look at the first word of what came in
+        t.replace(pos, end - pos, it->second);
         continue;
       }
     }
@@ -293,11 +471,9 @@ static std::string expandAliases(const std::string &input) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Command substitution: `cmd` and $(cmd) are run first. The output waits in outputs and the line gets
-//    \x01<number>\x02 in its place, so the output is not read as shell syntax by the later phases
+// 2. Command substitution
 // ---------------------------------------------------------------------------
 
-// Run cmd as a copy of this shell, with its output in a pipe. The trailing new lines are removed
 static std::string captureCommand(const std::string &cmd, int &status) {
   status = 0;
   int fd[2];
@@ -311,6 +487,7 @@ static std::string captureCommand(const std::string &cmd, int &status) {
     close(fd[1]);
     gSubshell = true;
     gInteractive = false;
+    gBreakLevel = 0; gContinueLevel = 0; gLoopDepth = 0;
     if (++gSubstDepth > 16) { err("command substitutions are nested too deep"); _exit(2); }
     signal(SIGINT, SIG_DFL);
     signal(SIGQUIT, SIG_DFL);
@@ -337,7 +514,6 @@ static std::string captureCommand(const std::string &cmd, int &status) {
   return out;
 }
 
-// Quotes are followed like in the other phases: nothing is run in single quotes, and \$( does not start a command
 static bool substituteCommands(const std::string &text, std::vector<std::string> &outputs, std::string &result, std::string &error) {
   result.clear();
   bool inSingle = false, inDouble = false;
@@ -359,7 +535,7 @@ static bool substituteCommands(const std::string &text, std::vector<std::string>
     } else if (c == '`') {
       const size_t close = matchBacktick(text, i);
       if (close == std::string::npos) { error = "syntax error: unterminated backtick"; return false; }
-      for (size_t k = i + 1; k < close; k++) { // in backticks \` \$ and \\ lose the backslash
+      for (size_t k = i + 1; k < close; k++) {
         if (text[k] == '\\' && k + 1 < close && (text[k + 1] == '`' || text[k + 1] == '$' || text[k + 1] == '\\')) { k++; }
         inner += text[k];
       }
@@ -379,23 +555,21 @@ static bool substituteCommands(const std::string &text, std::vector<std::string>
 }
 
 // ---------------------------------------------------------------------------
-// 3. The expansions and the words
+// 3. Expansions and words
 // ---------------------------------------------------------------------------
 
 struct Field {
-  std::string text;      // what the word is
-  std::string pattern;   // the same, with a backslash in front of the * ? [ that were quoted: for glob()
+  std::string text;
+  std::string pattern;
   bool glob;
   Field() : glob(false) {}
 };
 
-// Collects the fields of one word. A word is more than one field when an expansion is split at the blanks
 struct WordBuilder {
   std::vector<Field> done;
   Field cur;
   bool started;
   WordBuilder() : started(false) {}
-  // typed text. A quoted * ? [ is just a character, an unquoted one makes the word a pattern
   void literal(const std::string &s, bool quoted) {
     cur.text += s;
     if (quoted) {
@@ -414,7 +588,6 @@ struct WordBuilder {
     cur = Field();
     started = false;
   }
-  // the value of an unquoted $var or $(cmd): the blanks in it separate fields
   void splitValue(const std::string &v) {
     size_t i = 0;
     while (i < v.size()) {
@@ -424,7 +597,7 @@ struct WordBuilder {
       } else {
         size_t j = i;
         while (j < v.size() && !isBlank(v[j])) { j++; }
-        literal(v.substr(i, j - i), true); // the * in a value does not match files
+        literal(v.substr(i, j - i), true);
         i = j;
       }
     }
@@ -449,7 +622,6 @@ class Parser {
   friend bool parseRedirectAt(const std::string &, size_t &, int, bool, Stage &, const std::vector<std::string> &, std::string &);
 };
 
-// \x01<number>\x02: the output of a command substitution, it is used as it is
 void Parser::placeholder(WordBuilder &wb, bool quoted, bool assignment) {
   size_t j = i + 1;
   size_t index = 0;
@@ -460,7 +632,6 @@ void Parser::placeholder(WordBuilder &wb, bool quoted, bool assignment) {
   i = j;
 }
 
-// ~ and ~user at the start of a word
 void Parser::tilde(WordBuilder &wb) {
   size_t j = i + 1;
   while (j < text.size() && (isNameChar(text[j]) || text[j] == '.' || text[j] == '-')) { j++; }
@@ -481,7 +652,6 @@ void Parser::tilde(WordBuilder &wb) {
   i++;
 }
 
-// $name ${name} $? $$ $0. Inside double quotes the value is one piece, outside it is split into fields
 bool Parser::expandDollar(WordBuilder &wb, bool quoted, bool assignment, std::string &error) {
   if (i + 1 >= text.size()) { wb.literal("$", true); i++; return true; }
   const char d = text[i + 1];
@@ -489,7 +659,7 @@ bool Parser::expandDollar(WordBuilder &wb, bool quoted, bool assignment, std::st
   if (d == '{') {
     const size_t e = text.find('}', i + 2);
     if (e == std::string::npos) { error = "syntax error: ${ without }"; return false; }
-    name = text.substr(i + 2, e - i - 2);
+        name = text.substr(i + 2, e - i - 2);
     if (!isValidName(name) && name != "?" && name != "$") { error = "${" + name + "}: bad substitution"; return false; }
     i = e + 1;
   } else if (d == '?' || d == '$' || d == '0') {
@@ -513,10 +683,9 @@ bool Parser::expandDollar(WordBuilder &wb, bool quoted, bool assignment, std::st
   return true;
 }
 
-// i is at the opening quote
 bool Parser::parseDouble(WordBuilder &wb, std::string &error) {
   i++;
-  wb.started = true; // "" is a word, an empty one
+  wb.started = true;
   while (i < text.size()) {
     const char c = text[i];
     if (c == '"') { i++; return true; }
@@ -535,7 +704,6 @@ bool Parser::parseDouble(WordBuilder &wb, std::string &error) {
   return false;
 }
 
-// One word: up to a blank or | < >. assignment: the value of NAME=value is one piece, never split or matched with files
 bool Parser::parseWord(WordBuilder &wb, bool assignment, std::string &error) {
   while (i < text.size()) {
     const char c = text[i];
@@ -561,7 +729,6 @@ bool Parser::parseWord(WordBuilder &wb, bool assignment, std::string &error) {
   return true;
 }
 
-// The files that a pattern matches, or the word as it was typed
 static void expandField(const Field &f, std::vector<std::string> &out) {
   if (f.glob) {
     glob_t g;
@@ -576,7 +743,6 @@ static void expandField(const Field &f, std::vector<std::string> &out) {
   out.push_back(f.text);
 }
 
-// text[i] is at < or >: 2>file  >>file  <file  2>&1
 static bool parseRedirectAt(const std::string &text, size_t &i, int fd, bool haveFd, Stage &st, const std::vector<std::string> &outputs, std::string &error) {
   Redirect r;
   r.dupFd = -1;
@@ -667,7 +833,10 @@ bool Parser::parse(std::vector<Stage> &stages, std::string &error) {
 // Builtins
 // ---------------------------------------------------------------------------
 
-static const char *const builtinNames[] = { "cd", "exit", "history", "alias", "unalias", "export", "unset", "set", "jobs", "fg", "bg" };
+static const char *const builtinNames[] = {
+  "cd", "exit", "history", "alias", "unalias", "export", "unset", "set",
+  "jobs", "fg", "bg", "break", "continue"
+};
 
 static bool isBuiltin(const std::string &name) {
   for (size_t i = 0; i < sizeof(builtinNames) / sizeof(builtinNames[0]); i++) { if (name == builtinNames[i]) { return true; } }
@@ -708,7 +877,6 @@ static int builtinHistory() {
   return 0;
 }
 
-// alias, alias name, alias name=value
 static int builtinAlias(const std::vector<std::string> &a) {
   if (a.size() == 1) {
     std::map<std::string, std::string> sorted(aliases.begin(), aliases.end());
@@ -772,7 +940,6 @@ static void giveTerminalTo(pid_t pgid) {
   if (gInteractive && !gSubshell) { tcsetpgrp(STDIN_FILENO, pgid); }
 }
 
-// Wait for the processes of a job that runs in the foreground. true: it was stopped (Ctrl+Z)
 static bool waitJob(Job &job) {
   std::vector<pid_t> alive;
   bool stopped = false;
@@ -783,7 +950,7 @@ static bool waitJob(Job &job) {
     do { r = waitpid(job.pids[i], &st, WUNTRACED); } while (r < 0 && errno == EINTR);
     if (r < 0) { continue; }
     if (WIFSTOPPED(st)) { stopped = true; alive.push_back(job.pids[i]); gLastStatus = 128 + WSTOPSIG(st); continue; }
-    if (i + 1 == job.pids.size()) { gLastStatus = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st); } // the status of the last command
+    if (i + 1 == job.pids.size()) { gLastStatus = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st); }
   }
   job.pids.swap(alive);
   return stopped;
@@ -841,8 +1008,42 @@ static int builtinJobs() {
 
 static int builtinExit(const std::vector<std::string> &a) {
   gExit = true;
-  gExitCode = a.size() > 1 ? static_cast<int>(std::strtol(a[1].c_str(), NULL, 10)) & 0xFF : gLastStatus;
+  if (a.size() > 1) {
+    char *end = NULL;
+    const long code = std::strtol(a[1].c_str(), &end, 10);
+    if (end == a[1].c_str() || *end != '\0') {
+      err("exit: " + a[1] + ": numeric argument required");
+      gExitCode = 2;
+      return 2;
+    }
+    gExitCode = static_cast<int>(code) & 0xFF;
+  } else {
+    gExitCode = gLastStatus;
+  }
   return gExitCode;
+}
+
+// break [N] / continue [N]
+static int builtinBreakOrContinue(const std::vector<std::string> &a, bool isBreak) {
+  const char *name = isBreak ? "break" : "continue";
+  int level = 1;
+  if (a.size() > 1) {
+    char *end = NULL;
+    const long n = std::strtol(a[1].c_str(), &end, 10);
+    if (end == a[1].c_str() || *end != '\0' || n <= 0) {
+      err(std::string(name) + ": " + a[1] + ": numeric argument required");
+      return 2;
+    }
+    level = static_cast<int>(n);
+  }
+  if (a.size() > 2) { err(std::string(name) + ": too many arguments"); return 1; }
+  if (gLoopDepth == 0) {
+    err(std::string(name) + ": only meaningful in a loop");
+    return 1;
+  }
+  if (level > gLoopDepth) { level = gLoopDepth; }
+  if (isBreak) { gBreakLevel = level; } else { gContinueLevel = level; }
+  return 0;
 }
 
 static int runBuiltinBody(const std::vector<std::string> &a) {
@@ -858,6 +1059,8 @@ static int runBuiltinBody(const std::vector<std::string> &a) {
   if (n == "jobs") { return builtinJobs(); }
   if (n == "fg") { return builtinFg(a); }
   if (n == "bg") { return builtinBg(a); }
+  if (n == "break") { return builtinBreakOrContinue(a, true); }
+  if (n == "continue") { return builtinBreakOrContinue(a, false); }
   return 127;
 }
 
@@ -879,14 +1082,23 @@ static bool applyRedirects(const std::vector<Redirect> &redirs, std::string &err
     const int fd = open(r.path.c_str(), flags, 0666);
     if (fd < 0) { error = r.path + ": " + std::strerror(errno); return false; }
     if (fd != r.fd) { dup2(fd, r.fd); close(fd); }
+    // clear FD_CLOEXEC so exec'ing children inherit the redirected descriptor
+    const int fl = fcntl(r.fd, F_GETFD);
+    if (fl >= 0) { fcntl(r.fd, F_SETFD, fl & ~FD_CLOEXEC); }
   }
   return true;
 }
 
-// A builtin (and "NAME=value" alone) in this process, its redirections are undone afterwards
+// A builtin (and "NAME=value" alone) in this process; its redirections are undone afterwards.
+// Every descriptor the redirections touched is saved and restored, not only 0/1/2.
 static int runInProcess(const Stage &st) {
-  int saved[3];
-  for (int fd = 0; fd < 3; fd++) { saved[fd] = fcntl(fd, F_DUPFD_CLOEXEC, 10); }
+  std::vector<int> touched;
+  for (size_t i = 0; i < st.redirs.size(); i++) { touched.push_back(st.redirs[i].fd); }
+  if (touched.empty()) { touched.push_back(0); touched.push_back(1); touched.push_back(2); }
+  std::sort(touched.begin(), touched.end());
+  touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+  std::vector<int> saved(touched.size(), -1);
+  for (size_t i = 0; i < touched.size(); i++) { saved[i] = fcntl(touched[i], F_DUPFD_CLOEXEC, 10); }
   flushOutput();
   std::string error;
   int status = 1;
@@ -901,14 +1113,16 @@ static int runInProcess(const Stage &st) {
     err(error);
   }
   flushOutput();
-  for (int fd = 0; fd < 3; fd++) { if (saved[fd] >= 0) { dup2(saved[fd], fd); close(saved[fd]); } }
+  for (size_t i = 0; i < touched.size(); i++) {
+    if (saved[i] >= 0) { dup2(saved[i], touched[i]); close(saved[i]); }
+  }
   return status;
 }
 
 static void childExec(const Stage &st) {
   std::string error;
   if (!applyRedirects(st.redirs, error)) { err(error); _exit(1); }
-  for (size_t i = 0; i < st.assigns.size(); i++) { setenv(st.assigns[i].first.c_str(), st.assigns[i].second.c_str(), 1); } // FOO=1 cmd: only for cmd
+  for (size_t i = 0; i < st.assigns.size(); i++) { setenv(st.assigns[i].first.c_str(), st.assigns[i].second.c_str(), 1); }
   if (st.argv.empty()) { _exit(0); }
   if (isBuiltin(st.argv[0])) { const int status = runBuiltinBody(st.argv); flushOutput(); _exit(status & 0xFF); }
   std::vector<char *> args;
@@ -917,7 +1131,7 @@ static void childExec(const Stage &st) {
   execvp(args[0], args.data());
   const int e = errno;
   err(st.argv[0] + (e == ENOENT ? ": command not found" : std::string(": ") + std::strerror(e)));
-  _exit(e == ENOENT ? 127 : 126); // not exit(): it would write the buffers of the shell a second time
+  _exit(e == ENOENT ? 127 : 126);
 }
 
 static void launchPipeline(const std::vector<Stage> &stages, bool background, const std::string &commandText) {
@@ -930,7 +1144,7 @@ static void launchPipeline(const std::vector<Stage> &stages, bool background, co
   job.pgid = 0;
   job.command = commandText;
   job.running = true;
-  const bool control = gInteractive && !gSubshell; // the processes get a group of their own, and the terminal
+  const bool control = gInteractive && !gSubshell;
   flushOutput();
   for (size_t i = 0; i < n; i++) {
     const pid_t pid = fork();
@@ -980,7 +1194,6 @@ static void executeStages(const std::vector<Stage> &stages, bool background, con
   launchPipeline(stages, background, commandText);
 }
 
-// Finished jobs are told before the prompt, a signal handler is not allowed to write
 static void reapJobs() {
   for (std::map<int, Job>::iterator it = jobs.begin(); it != jobs.end();) {
     Job &job = it->second;
@@ -1008,28 +1221,129 @@ static void reapJobs() {
 // ---------------------------------------------------------------------------
 
 static void runPipelineText(const std::string &raw, bool background) {
-  const std::string aliased = expandAliases(raw);                       // 1
+  const std::string aliased = expandAliases(raw);
   std::vector<std::string> outputs;
   std::string substituted, error;
-  if (!substituteCommands(aliased, outputs, substituted, error)) { err(error); gLastStatus = 2; return; } // 2: runs the commands now
+  if (!substituteCommands(aliased, outputs, substituted, error)) { err(error); gLastStatus = 2; return; }
   std::vector<Stage> stages;
   Parser parser(substituted, outputs);
-  if (!parser.parse(stages, error)) { err(error); gLastStatus = 2; return; }                              // 3
+  if (!parser.parse(stages, error)) { err(error); gLastStatus = 2; return; }
   if (stages.empty()) { return; }
-  executeStages(stages, background, raw);                               // 4
+  executeStages(stages, background, raw);
 }
+
+// ---------------------------------------------------------------------------
+// Compound commands: for / while / until
+// ---------------------------------------------------------------------------
+
+// Split a `for … in …` word list using the same pipeline as a normal command line.
+static bool splitForItems(const std::string &itemsText, std::vector<std::string> &items, std::string &error) {
+  if (itemsText.empty()) { return true; }
+  std::vector<std::string> outputs;
+  std::string sub;
+  if (!substituteCommands(itemsText, outputs, sub, error)) { return false; }
+  std::vector<Stage> stages;
+  Parser p(sub, outputs);
+  if (!p.parse(stages, error)) { return false; }
+  if (stages.size() != 1 || !stages[0].redirs.empty() || !stages[0].assigns.empty()) {
+    error = "syntax error: for: bad word list";
+    return false;
+  }
+  items = stages[0].argv;
+  return true;
+}
+
+static int runForLoop(const Compound &c) {
+  std::vector<std::string> items;
+  std::string error;
+  if (c.haveIn) {
+    if (!splitForItems(c.itemsText, items, error)) { err(error); return 2; }
+  } else {
+    // No `in` clause: iterate "$@" — this shell has no positional parameters, so zero iterations.
+  }
+  const int savedDepth = gLoopDepth;
+  gLoopDepth++;
+  int status = 0;
+  for (size_t k = 0; k < items.size(); k++) {
+    gBreakLevel = 0; gContinueLevel = 0;
+    setVariable(c.var, items[k]);
+    runLine(c.body);
+    if (gBreakLevel > 0) {
+      gBreakLevel--;
+      if (gBreakLevel == 0) { status = gLastStatus; break; }
+      gLoopDepth = savedDepth;
+      return gLastStatus;
+    }
+    if (gContinueLevel > 0) {
+      gContinueLevel--;
+      if (gContinueLevel > 0) { gLoopDepth = savedDepth; return gLastStatus; }
+      continue;
+    }
+    status = gLastStatus;
+    if (gExit) { break; }
+  }
+  gLoopDepth = savedDepth;
+  return status;
+}
+
+static int runWhileLoop(const Compound &c) {
+  const int savedDepth = gLoopDepth;
+  gLoopDepth++;
+  int status = 0;
+  while (!gExit) {
+    gBreakLevel = 0; gContinueLevel = 0;
+    runLine(c.cond);
+    if (gBreakLevel > 0) { gBreakLevel = 0; break; }
+    if (gContinueLevel > 0) { gContinueLevel = 0; continue; }
+    if (gExit) { break; }
+    const bool condTrue = (gLastStatus == 0);
+    const bool runBody = (c.keyword == "while") ? condTrue : !condTrue;
+    if (!runBody) { status = 0; break; }
+    runLine(c.body);
+    if (gBreakLevel > 0) {
+      gBreakLevel--;
+      if (gBreakLevel == 0) { status = gLastStatus; break; }
+      gLoopDepth = savedDepth;
+      return gLastStatus;
+    }
+    if (gContinueLevel > 0) {
+      gContinueLevel--;
+      if (gContinueLevel > 0) { gLoopDepth = savedDepth; return gLastStatus; }
+      continue;
+    }
+    status = gLastStatus;
+    if (gExit) { break; }
+  }
+  gLoopDepth = savedDepth;
+  return status;
+}
+
+// ---------------------------------------------------------------------------
+// The list of one line
+// ---------------------------------------------------------------------------
 
 static void runLine(const std::string &line) {
   std::string clean;
-  for (size_t i = 0; i < line.size(); i++) { if (line[i] != '\x01' && line[i] != '\x02') { clean += line[i]; } } // these two are kept for the output of $( )
+  for (size_t i = 0; i < line.size(); i++) {
+    if (line[i] != '\x01' && line[i] != '\x02') { clean += line[i]; }
+  }
   std::vector<ListItem> items;
   std::string error;
   if (!splitList(clean, items, error)) { err(error); gLastStatus = 2; return; }
   char before = ';';
   for (size_t k = 0; k < items.size() && !gExit; k++) {
-    // && and || look at the status of the command before; the expansions of a command are done when it is its turn
-    const bool run = before == ';' || before == '&' || before == 0 || (before == 'a' && gLastStatus == 0) || (before == 'o' && gLastStatus != 0);
-    if (run) { runPipelineText(items[k].text, items[k].op == '&'); }
+    const bool run = before == ';' || before == '&' || before == 0
+                  || (before == 'a' && gLastStatus == 0)
+                  || (before == 'o' && gLastStatus != 0);
+    if (run) {
+      if (items[k].isCompound) {
+        const Compound &c = items[k].compound;
+        const int st = (c.keyword == "for") ? runForLoop(c) : runWhileLoop(c);
+        gLastStatus = st & 0xFF;
+      } else {
+        runPipelineText(items[k].text, items[k].op == '&');
+      }
+    }
     before = items[k].op;
   }
 }
@@ -1060,7 +1374,7 @@ static void loadSystemCommands() {
         if (entry->d_name[0] == '.') { continue; }
         const std::string full = dir + "/" + entry->d_name;
         struct stat st;
-        if (stat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode) && access(full.c_str(), X_OK) == 0) { commandList.push_back(entry->d_name); } // not every file is a command
+        if (stat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode) && access(full.c_str(), X_OK) == 0) { commandList.push_back(entry->d_name); }
       }
       closedir(dp);
     }
@@ -1087,7 +1401,6 @@ static char *commandGenerator(const char *text, int state) {
   return NULL;
 }
 
-// Commands are completed at the start of the line and after | ; & ( , the other words are file names
 static char **myCompletion(const char *text, int start, int end) {
   static_cast<void>(end);
   int k = start - 1;
@@ -1113,7 +1426,8 @@ static void initShell() {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc >= 3 && std::strcmp(argv[1], "-c") == 0) { // 0vershell -c 'command line'
+  gShellPid = getpid();  // $$ must stay the same inside $( … )
+  if (argc >= 3 && std::strcmp(argv[1], "-c") == 0) {
     gShellPgid = getpgrp();
     runLine(argv[2]);
     flushOutput();
@@ -1130,7 +1444,7 @@ int main(int argc, char *argv[]) {
   while (!gExit) {
     reapJobs();
     char *input = readline("0vershell> ");
-    if (!input) { // EOF (Ctrl+D)
+    if (!input) {
       std::cout << "\n";
       break;
     }
@@ -1145,7 +1459,7 @@ int main(int argc, char *argv[]) {
     runLine(line);
   }
   write_history(historyPath.c_str());
-  chmod(historyPath.c_str(), 0600); // what was typed is private
+  chmod(historyPath.c_str(), 0600);
   flushOutput();
   return gExit ? gExitCode : (gLastStatus & 0xFF);
 }
