@@ -34,7 +34,11 @@
  *
  * Compound commands can be nested, can be followed by ; && || and can span several lines
  * (a newline works like ;).  The condition of while / until / if is any command list, its last
- * exit status decides.  There is no `test` builtin: use the external `test` or `[`.
+ * exit status decides.
+ *
+ * test, [ and [[ are builtins.  They are ordinary commands, not keywords: the spaces around
+ * [ ] [[ ]] are required, quote the variables ("$x"), and use -a / -o instead of && / || inside.
+ * Supported: -z -n -e -f -d -L -h -s -r -w -x, = == !=, -eq -ne -lt -le -gt -ge, ! -a -o.
  *
  * There is no print command: write  echo $var  as in every shell.
  */
@@ -885,7 +889,7 @@ bool Parser::parse(std::vector<Stage> &stages, std::string &error) {
 
 static const char *const builtinNames[] = {
   "cd", "exit", "history", "alias", "unalias", "export", "unset", "set",
-  "jobs", "fg", "bg", "break", "continue"
+  "jobs", "fg", "bg", "break", "continue", "test", "[", "[["
 };
 
 static bool isBuiltin(const std::string &name) {
@@ -1096,6 +1100,87 @@ static int builtinBreakOrContinue(const std::vector<std::string> &a, bool isBrea
   return 0;
 }
 
+// ---- test / [ / [[ ----
+
+static bool testNumber(const std::string &s, long &out) {
+  char *end = NULL;
+  errno = 0;
+  out = std::strtol(s.c_str(), &end, 10);
+  return !s.empty() && *end == '\0' && errno == 0;
+}
+
+static bool testUnary(const std::string &op, const std::string &arg, bool &known) {
+  known = true;
+  struct stat st;
+  if (op == "-z") { return arg.empty(); }
+  if (op == "-n") { return !arg.empty(); }
+  if (op == "-e") { return stat(arg.c_str(), &st) == 0; }
+  if (op == "-f") { return stat(arg.c_str(), &st) == 0 && S_ISREG(st.st_mode); }
+  if (op == "-d") { return stat(arg.c_str(), &st) == 0 && S_ISDIR(st.st_mode); }
+  if (op == "-L" || op == "-h") { return lstat(arg.c_str(), &st) == 0 && S_ISLNK(st.st_mode); }
+  if (op == "-s") { return stat(arg.c_str(), &st) == 0 && st.st_size > 0; }
+  if (op == "-r") { return access(arg.c_str(), R_OK) == 0; }
+  if (op == "-w") { return access(arg.c_str(), W_OK) == 0; }
+  if (op == "-x") { return access(arg.c_str(), X_OK) == 0; }
+  known = false;
+  return false;
+}
+
+// Evaluates v[b, e).  `bad` is set on a syntax error.
+static bool testExpr(const std::vector<std::string> &v, size_t b, size_t e, bool &bad) {
+  if (bad) { return false; }
+  for (size_t i = b + 1; i + 1 < e; i++) {            // lowest precedence: -o, then -a
+    if (v[i] == "-o") { return testExpr(v, b, i, bad) || testExpr(v, i + 1, e, bad); }
+  }
+  for (size_t i = b + 1; i + 1 < e; i++) {
+    if (v[i] == "-a") { return testExpr(v, b, i, bad) && testExpr(v, i + 1, e, bad); }
+  }
+  const size_t n = e - b;
+  if (n == 0) { return false; }
+  if (v[b] == "!") { return !testExpr(v, b + 1, e, bad); }
+  if (n == 1) { return !v[b].empty(); }
+  if (n == 2) {
+    bool known = false;
+    const bool r = testUnary(v[b], v[b + 1], known);
+    if (!known) { bad = true; err("test: " + v[b] + ": unary operator expected"); }
+    return r;
+  }
+  if (n == 3) {
+    const std::string &l = v[b], &op = v[b + 1], &r = v[b + 2];
+    if (op == "=" || op == "==") { return l == r; }
+    if (op == "!=") { return l != r; }
+    if (op == "-eq" || op == "-ne" || op == "-lt" || op == "-le" || op == "-gt" || op == "-ge") {
+      long x = 0, y = 0;
+      if (!testNumber(l, x) || !testNumber(r, y)) {
+        bad = true; err("test: integer expression expected: '" + l + "' '" + r + "'"); return false;
+      }
+      if (op == "-eq") { return x == y; }
+      if (op == "-ne") { return x != y; }
+      if (op == "-lt") { return x < y; }
+      if (op == "-le") { return x <= y; }
+      if (op == "-gt") { return x > y; }
+      return x >= y;
+    }
+  }
+  bad = true;
+  err("test: syntax error");
+  return false;
+}
+
+// test EXPR   |   [ EXPR ]   |   [[ EXPR ]]      0 = true, 1 = false, 2 = error
+static int builtinTest(const std::vector<std::string> &a) {
+  size_t e = a.size();
+  if (a[0] == "[" || a[0] == "[[") {
+    const char *close = a[0] == "[" ? "]" : "]]";
+    if (e < 2 || a[e - 1] != close) { err(a[0] + ": missing '" + close + "'"); return 2; }
+    e--;
+  }
+  bool bad = false;
+  const bool r = testExpr(a, 1, e, bad);
+  if (bad) { return 2; }
+  return r ? 0 : 1;
+}
+
 static int runBuiltinBody(const std::vector<std::string> &a) {
   const std::string &n = a[0];
   if (n == "cd") { return builtinCd(a); }
@@ -1111,6 +1196,7 @@ static int runBuiltinBody(const std::vector<std::string> &a) {
   if (n == "bg") { return builtinBg(a); }
   if (n == "break") { return builtinBreakOrContinue(a, true); }
   if (n == "continue") { return builtinBreakOrContinue(a, false); }
+  if (n == "test" || n == "[" || n == "[[") { return builtinTest(a); }
   return 127;
 }
 
