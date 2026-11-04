@@ -24,8 +24,17 @@
  *   3. the expansions    quotes, $var ${var} $? $$, ~, word splitting, * ? [ ]
  *   4. the command       builtin, or fork and exec, with pipes and redirections
  *
- * Compound commands (for / while / until) are recognised at list level, before step 1 of
- * their bodies, and their bodies / conditions are fed back through the same pipeline.
+ * Compound commands are recognised at list level, before step 1 of their bodies, and their
+ * bodies / conditions are fed back through the same pipeline:
+ *
+ *   for NAME [in WORDS]; do BODY; done
+ *   while COND; do BODY; done
+ *   until COND; do BODY; done
+ *   if COND; then BODY [elif COND; then BODY]... [else BODY]; fi
+ *
+ * Compound commands can be nested, can be followed by ; && || and can span several lines
+ * (a newline works like ;).  The condition of while / until / if is any command list, its last
+ * exit status decides.  There is no `test` builtin: use the external `test` or `[`.
  *
  * There is no print command: write  echo $var  as in every shell.
  */
@@ -41,6 +50,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <dirent.h>
 #include <fcntl.h>
@@ -66,6 +76,7 @@ struct Redirect {
   RedirectKind kind;
   std::string path;
   int dupFd;
+  Redirect() : fd(0), kind(R_IN), dupFd(-1) {}
 };
 
 struct Stage {
@@ -80,19 +91,24 @@ struct Job {
   std::string command;
   bool running;
   std::vector<pid_t> pids;
+  Job() : pgid(0), running(true) {}
 };
 
-// A for / while / until compound command found in a line
+// A for / while / until / if compound command found in a line
 struct Compound {
   size_t begin;
   size_t end;
-  std::string keyword;      // "for", "while", "until"
+  std::string keyword;      // "for", "while", "until", "if"
   std::string var;          // for: loop variable
   std::string itemsText;    // for: raw text after `in`, or "" for `for x; do`
   bool haveIn;
   std::string cond;         // while/until: the condition text
-  std::string body;
-  Compound() : begin(0), end(0), haveIn(false) {}
+  std::string body;         // for/while/until: the loop body
+  // if: the (condition, body) of the `if` and of every `elif`, in order
+  std::vector<std::pair<std::string, std::string> > clauses;
+  std::string elseBody;     // if: the `else` part
+  bool haveElse;
+  Compound() : begin(0), end(0), haveIn(false), haveElse(false) {}
 };
 
 struct ListItem {
@@ -208,14 +224,17 @@ static size_t skipDouble(const std::string &t, size_t i) {
 }
 
 // ---------------------------------------------------------------------------
-// Compound commands (for / while / until) — parsing helpers
+// Compound commands (for / while / until / if) — parsing helpers
 // ---------------------------------------------------------------------------
 
+// A reserved word must be followed by a blank, end of text or an operator character,
+// so that `done.sh` or `fi-x` are ordinary command names.
 static bool wordAt(const std::string &t, size_t pos, const char *word) {
   const size_t n = std::strlen(word);
-  if (t.compare(pos, n, word) != 0) { return false; }
+  if (pos > t.size() || t.compare(pos, n, word) != 0) { return false; }
   const size_t e = pos + n;
-  return e >= t.size() || !isNameChar(t[e]);
+  return e >= t.size() || isBlank(t[e]) || t[e] == ';' || t[e] == '&' || t[e] == '|' ||
+         t[e] == '(' || t[e] == ')' || t[e] == '<' || t[e] == '>';
 }
 
 static size_t skipSpace(const std::string &t, size_t i) {
@@ -225,34 +244,22 @@ static size_t skipSpace(const std::string &t, size_t i) {
 
 static bool atCommandBoundary(const std::string &t, size_t p, size_t floor) {
   size_t q = p;
-  while (q > floor && isBlank(t[q - 1])) { q--; }
+  // only spaces and tabs are skipped: a newline is itself a command boundary
+  while (q > floor && (t[q - 1] == ' ' || t[q - 1] == '\t' || t[q - 1] == '\r')) { q--; }
   if (q == floor || q == 0) { return true; }
   const char b = t[q - 1];
   return b == ';' || b == '\n' || b == '(' || b == '{' || b == '|' || b == '&';
 }
 
-static size_t findKeyword(const std::string &t, size_t from, const char *word) {
-  for (size_t k = from; k < t.size();) {
-    const char ch = t[k];
-    if (ch == '\\') { k += 2; continue; }
-    if (ch == '\'') { const size_t e = t.find('\'', k + 1); if (e == std::string::npos) { return std::string::npos; } k = e + 1; continue; }
-    if (ch == '"')  { const size_t e = skipDouble(t, k);    if (e == std::string::npos) { return std::string::npos; } k = e + 1; continue; }
-    if (ch == '`')  { const size_t e = matchBacktick(t, k); if (e == std::string::npos) { return std::string::npos; } k = e + 1; continue; }
-    if (ch == '$' && k + 1 < t.size() && t[k + 1] == '(') {
-      const size_t e = matchParen(t, k + 1);
-      if (e == std::string::npos) { return std::string::npos; }
-      k = e + 1; continue;
-    }
-    if (isNameStart(ch) && wordAt(t, k, word) && atCommandBoundary(t, k, from)) { return k; }
-    k++;
-  }
-  return std::string::npos;
+static bool isCompoundStart(const std::string &t, size_t p) {
+  return wordAt(t, p, "for") || wordAt(t, p, "while") || wordAt(t, p, "until") || wordAt(t, p, "if");
 }
 
 static bool parseCompoundAt(const std::string &t, size_t i, Compound &c, std::string &error);
 
-static size_t matchDone(const std::string &t, size_t from, std::string &error) {
-  int depth = 1;
+// Find the first of `words` that stands where a command starts, at the same nesting level as `from`:
+// quotes, $( ), ` ` and whole nested compound commands are skipped.  `which` is the index of the word found.
+static size_t scanFor(const std::string &t, size_t from, const char *const *words, size_t count, size_t &which, std::string &error) {
   size_t p = from;
   while (p < t.size()) {
     const char ch = t[p];
@@ -265,22 +272,23 @@ static size_t matchDone(const std::string &t, size_t from, std::string &error) {
       if (e == std::string::npos) { error = "syntax error: unterminated $("; return std::string::npos; }
       p = e + 1; continue;
     }
+    if (ch == '#' && (p == from || isBlank(t[p - 1]))) {
+      while (p < t.size() && t[p] != '\n') { p++; }
+      continue;
+    }
     if (isNameStart(ch) && atCommandBoundary(t, p, from)) {
-      if (wordAt(t, p, "for") || wordAt(t, p, "while") || wordAt(t, p, "until")) {
+      if (isCompoundStart(t, p)) {
         Compound inner;
         if (!parseCompoundAt(t, p, inner, error)) { return std::string::npos; }
         p = inner.end;
         continue;
       }
-      if (wordAt(t, p, "done")) {
-        if (--depth == 0) { return p; }
-        p += 4; continue;
+      for (size_t w = 0; w < count; w++) {
+        if (wordAt(t, p, words[w])) { which = w; return p; }
       }
-      if (wordAt(t, p, "do")) { p += 2; continue; }
     }
     p++;
   }
-  error = "syntax error: done not found";
   return std::string::npos;
 }
 
@@ -291,8 +299,47 @@ static void stripTrailingSemicolon(std::string &s) {
   }
 }
 
+static bool parseIfAt(const std::string &t, size_t i, Compound &c, std::string &error) {
+  static const char *const thenWord[] = { "then" };
+  static const char *const afterBody[] = { "elif", "else", "fi" };
+  static const char *const fiWord[] = { "fi" };
+  c.keyword = "if";
+  size_t which = 0;
+  size_t k = i + 2;
+  while (true) {
+    const size_t thenPos = scanFor(t, k, thenWord, 1, which, error);
+    if (thenPos == std::string::npos) { if (error.empty()) { error = "syntax error: if: then not found"; } return false; }
+    std::string cond = trim(t.substr(k, thenPos - k));
+    stripTrailingSemicolon(cond);
+    if (cond.empty()) { error = "syntax error: if: the condition is missing"; return false; }
+    const size_t bodyStart = skipSpace(t, thenPos + 4);
+    const size_t stop = scanFor(t, bodyStart, afterBody, 3, which, error);
+    if (stop == std::string::npos) { if (error.empty()) { error = "syntax error: if: fi not found"; } return false; }
+    const std::string body = t.substr(bodyStart, stop - bodyStart);
+    if (trim(body).empty()) { error = "syntax error: if: the command list after then is empty"; return false; }
+    c.clauses.push_back(std::make_pair(cond, body));
+    if (which == 0) { k = stop + 4; continue; }          // elif: another condition follows
+    if (which == 1) {                                    // else
+      const size_t elseStart = skipSpace(t, stop + 4);
+      const size_t fiPos = scanFor(t, elseStart, fiWord, 1, which, error);
+      if (fiPos == std::string::npos) { if (error.empty()) { error = "syntax error: if: fi not found"; } return false; }
+      c.elseBody = t.substr(elseStart, fiPos - elseStart);
+      if (trim(c.elseBody).empty()) { error = "syntax error: if: the command list after else is empty"; return false; }
+      c.haveElse = true;
+      c.end = fiPos + 2;
+      return true;
+    }
+    c.end = stop + 2;                                    // fi
+    return true;
+  }
+}
+
 static bool parseCompoundAt(const std::string &t, size_t i, Compound &c, std::string &error) {
+  static const char *const doWord[] = { "do" };
+  static const char *const doneWord[] = { "done" };
   c.begin = i;
+  if (wordAt(t, i, "if")) { return parseIfAt(t, i, c, error); }
+  size_t which = 0;
   if (wordAt(t, i, "for")) {
     c.keyword = "for";
     size_t k = skipSpace(t, i + 3);
@@ -306,16 +353,15 @@ static bool parseCompoundAt(const std::string &t, size_t i, Compound &c, std::st
       c.haveIn = true;
       k = skipSpace(t, k + 2);
     }
-    const size_t doPos = findKeyword(t, k, "do");
-    if (doPos == std::string::npos) { error = "syntax error: for: do not found"; return false; }
+    const size_t doPos = scanFor(t, k, doWord, 1, which, error);
+    if (doPos == std::string::npos) { if (error.empty()) { error = "syntax error: for: do not found"; } return false; }
     if (c.haveIn) {
       c.itemsText = trim(t.substr(k, doPos - k));
       stripTrailingSemicolon(c.itemsText);
     }
     const size_t afterDo = skipSpace(t, doPos + 2);
-    std::string dummy;
-    const size_t donePos = matchDone(t, afterDo, dummy);
-    if (donePos == std::string::npos) { error = "syntax error: for: done not found"; return false; }
+    const size_t donePos = scanFor(t, afterDo, doneWord, 1, which, error);
+    if (donePos == std::string::npos) { if (error.empty()) { error = "syntax error: for: done not found"; } return false; }
     c.body = t.substr(afterDo, donePos - afterDo);
     c.end = donePos + 4;
     return true;
@@ -324,21 +370,21 @@ static bool parseCompoundAt(const std::string &t, size_t i, Compound &c, std::st
   const char *kw = isWhile ? "while" : "until";
   c.keyword = kw;
   const size_t k = i + std::strlen(kw);
-  const size_t doPos = findKeyword(t, k, "do");
-  if (doPos == std::string::npos) { error = std::string("syntax error: ") + c.keyword + ": do not found"; return false; }
+  const size_t doPos = scanFor(t, k, doWord, 1, which, error);
+  if (doPos == std::string::npos) { if (error.empty()) { error = c.keyword + ": do not found"; error = "syntax error: " + error; } return false; }
   c.cond = trim(t.substr(k, doPos - k));
   stripTrailingSemicolon(c.cond);
+  if (c.cond.empty()) { error = "syntax error: " + c.keyword + ": the condition is missing"; return false; }
   const size_t afterDo = skipSpace(t, doPos + 2);
-  std::string dummy;
-  const size_t donePos = matchDone(t, afterDo, dummy);
-  if (donePos == std::string::npos) { error = std::string("syntax error: ") + c.keyword + ": done not found"; return false; }
+  const size_t donePos = scanFor(t, afterDo, doneWord, 1, which, error);
+  if (donePos == std::string::npos) { if (error.empty()) { error = "syntax error: " + c.keyword + ": done not found"; } return false; }
   c.body = t.substr(afterDo, donePos - afterDo);
   c.end = donePos + 4;
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// The line is cut into commands at ; & && ||  (not in quotes, not inside $( ) or ` `).
+// The line is cut into commands at ; newline & && ||  (not in quotes, not inside $( ) or ` `).
 // A compound at a command boundary is kept whole in a single ListItem.
 // ---------------------------------------------------------------------------
 
@@ -348,9 +394,7 @@ static bool splitList(const std::string &s, std::vector<ListItem> &items, std::s
   const size_t n = s.size();
   while (i < n) {
     // A compound command begins here (at the start of the current item, after trimming)?
-    if (trim(cur).empty() && i < n && isNameStart(s[i]) &&
-        (wordAt(s, i, "for") || wordAt(s, i, "while") || wordAt(s, i, "until")) &&
-        atCommandBoundary(s, i, 0)) {
+    if (trim(cur).empty() && isNameStart(s[i]) && isCompoundStart(s, i) && atCommandBoundary(s, i, 0)) {
       Compound c;
       if (!parseCompoundAt(s, i, c, error)) { return false; }
       ListItem item;
@@ -358,20 +402,22 @@ static bool splitList(const std::string &s, std::vector<ListItem> &items, std::s
       item.isCompound = true;
       item.compound = c;
       i = c.end;
-      while (i < n && isBlank(s[i])) { i++; }
+      while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r')) { i++; }
       char op = 0;
       size_t used = 1;
       if (i < n) {
         const char ch = s[i];
-        if (ch == ';') { op = ';'; }
+        if (ch == ';' || ch == '\n') { op = ';'; }
         else if (ch == '&' && i + 1 < n && s[i + 1] == '&') { op = 'a'; used = 2; }
         else if (ch == '&') { op = '&'; }
         else if (ch == '|' && i + 1 < n && s[i + 1] == '|') { op = 'o'; used = 2; }
-        else { error = std::string("syntax error near '") + ch + "' after done"; return false; }
+        else if (ch == '#') { while (i < n && s[i] != '\n') { i++; } op = ';'; used = 0; }
+        else { error = std::string("syntax error near '") + ch + "' after the end of a compound command"; return false; }
         i += used;
       }
       item.op = op;
       items.push_back(item);
+      cur.clear();
       continue;
     }
 
@@ -399,8 +445,12 @@ static bool splitList(const std::string &s, std::vector<ListItem> &items, std::s
       if (e == std::string::npos) { error = "syntax error: unterminated $("; return false; }
       cur.append(s, i, e - i + 1); i = e + 1; continue;
     }
-    if (c == '#' && (cur.empty() || isBlank(cur[cur.size() - 1]))) { break; }
-    if (c == ';') { op = ';'; }
+    if (c == '\n' && trim(cur).empty()) { cur.clear(); i++; continue; }
+    if (c == '#' && (cur.empty() || isBlank(cur[cur.size() - 1]))) {
+      while (i < n && s[i] != '\n') { i++; }      // a comment runs to the end of the line
+      continue;
+    }
+    if (c == ';' || c == '\n') { op = ';'; }
     else if (c == '&' && i + 1 < n && s[i + 1] == '&') { op = 'a'; used = 2; }
     else if (c == '&' && !cur.empty() && (cur[cur.size() - 1] == '>' || cur[cur.size() - 1] == '<')) { cur += c; i++; continue; }
     else if (c == '&') { op = '&'; }
@@ -496,7 +546,7 @@ static std::string captureCommand(const std::string &cmd, int &status) {
     signal(SIGTTOU, SIG_DFL);
     runLine(cmd);
     flushOutput();
-    _exit(gLastStatus & 0xFF);
+    _exit(gExit ? gExitCode : (gLastStatus & 0xFF));
   }
   close(fd[1]);
   std::string out;
@@ -659,7 +709,7 @@ bool Parser::expandDollar(WordBuilder &wb, bool quoted, bool assignment, std::st
   if (d == '{') {
     const size_t e = text.find('}', i + 2);
     if (e == std::string::npos) { error = "syntax error: ${ without }"; return false; }
-        name = text.substr(i + 2, e - i - 2);
+    name = text.substr(i + 2, e - i - 2);
     if (!isValidName(name) && name != "?" && name != "$") { error = "${" + name + "}: bad substitution"; return false; }
     i = e + 1;
   } else if (d == '?' || d == '$' || d == '0') {
@@ -759,7 +809,7 @@ static bool parseRedirectAt(const std::string &text, size_t &i, int fd, bool hav
       i++;
       size_t j = i;
       int target = 0;
-      while (j < text.size() && text[j] >= '0' && text[j] <= '9') { target = target * 10 + (text[j] - '0'); j++; }
+      while (j < text.size() && text[j] >= '0' && text[j] <= '9' && target < 1000) { target = target * 10 + (text[j] - '0'); j++; }
       if (j == i) { error = "syntax error: a number is needed after >&"; return false; }
       r.dupFd = target;
       i = j;
@@ -900,10 +950,10 @@ static int builtinAlias(const std::vector<std::string> &a) {
 }
 
 static int builtinUnalias(const std::vector<std::string> &a) {
+  if (a.size() == 1) { err("unalias: usage: unalias [-a] name ..."); return 2; }
   if (a.size() == 2 && a[1] == "-a") { aliases.clear(); return 0; }
   int status = 0;
   for (size_t i = 1; i < a.size(); i++) { if (!aliases.erase(a[i])) { err("unalias: " + a[i] + ": not found"); status = 1; } }
-  if (a.size() == 1) { err("unalias: usage: unalias name"); return 2; }
   return status;
 }
 
@@ -1027,6 +1077,7 @@ static int builtinExit(const std::vector<std::string> &a) {
 static int builtinBreakOrContinue(const std::vector<std::string> &a, bool isBreak) {
   const char *name = isBreak ? "break" : "continue";
   int level = 1;
+  if (a.size() > 2) { err(std::string(name) + ": too many arguments"); return 1; }
   if (a.size() > 1) {
     char *end = NULL;
     const long n = std::strtol(a[1].c_str(), &end, 10);
@@ -1034,9 +1085,8 @@ static int builtinBreakOrContinue(const std::vector<std::string> &a, bool isBrea
       err(std::string(name) + ": " + a[1] + ": numeric argument required");
       return 2;
     }
-    level = static_cast<int>(n);
+    level = n > 1000000 ? 1000000 : static_cast<int>(n);
   }
-  if (a.size() > 2) { err(std::string(name) + ": too many arguments"); return 1; }
   if (gLoopDepth == 0) {
     err(std::string(name) + ": only meaningful in a loop");
     return 1;
@@ -1081,7 +1131,10 @@ static bool applyRedirects(const std::vector<Redirect> &redirs, std::string &err
     else if (r.kind == R_APPEND) { flags = O_WRONLY | O_CREAT | O_APPEND; }
     const int fd = open(r.path.c_str(), flags, 0666);
     if (fd < 0) { error = r.path + ": " + std::strerror(errno); return false; }
-    if (fd != r.fd) { dup2(fd, r.fd); close(fd); }
+    if (fd != r.fd) {
+      if (dup2(fd, r.fd) < 0) { error = std::to_string(r.fd) + ": " + std::strerror(errno); close(fd); return false; }
+      close(fd);
+    }
     // clear FD_CLOEXEC so exec'ing children inherit the redirected descriptor
     const int fl = fcntl(r.fd, F_GETFD);
     if (fl >= 0) { fcntl(r.fd, F_SETFD, fl & ~FD_CLOEXEC); }
@@ -1233,7 +1286,7 @@ static void runPipelineText(const std::string &raw, bool background) {
 }
 
 // ---------------------------------------------------------------------------
-// Compound commands: for / while / until
+// Compound commands: for / while / until / if
 // ---------------------------------------------------------------------------
 
 // Split a `for … in …` word list using the same pipeline as a normal command line.
@@ -1277,6 +1330,7 @@ static int runForLoop(const Compound &c) {
     if (gContinueLevel > 0) {
       gContinueLevel--;
       if (gContinueLevel > 0) { gLoopDepth = savedDepth; return gLastStatus; }
+      status = gLastStatus;
       continue;
     }
     status = gLastStatus;
@@ -1289,7 +1343,7 @@ static int runForLoop(const Compound &c) {
 static int runWhileLoop(const Compound &c) {
   const int savedDepth = gLoopDepth;
   gLoopDepth++;
-  int status = 0;
+  int status = 0;            // the status of the last body that ran (0 if none did)
   while (!gExit) {
     gBreakLevel = 0; gContinueLevel = 0;
     runLine(c.cond);
@@ -1298,7 +1352,7 @@ static int runWhileLoop(const Compound &c) {
     if (gExit) { break; }
     const bool condTrue = (gLastStatus == 0);
     const bool runBody = (c.keyword == "while") ? condTrue : !condTrue;
-    if (!runBody) { status = 0; break; }
+    if (!runBody) { break; }
     runLine(c.body);
     if (gBreakLevel > 0) {
       gBreakLevel--;
@@ -1309,6 +1363,7 @@ static int runWhileLoop(const Compound &c) {
     if (gContinueLevel > 0) {
       gContinueLevel--;
       if (gContinueLevel > 0) { gLoopDepth = savedDepth; return gLastStatus; }
+      status = gLastStatus;
       continue;
     }
     status = gLastStatus;
@@ -1316,6 +1371,25 @@ static int runWhileLoop(const Compound &c) {
   }
   gLoopDepth = savedDepth;
   return status;
+}
+
+// if COND; then BODY [elif COND; then BODY]... [else BODY]; fi
+// The status is the one of the body that ran, or 0 when no condition was true and there is no else.
+static int runIf(const Compound &c) {
+  for (size_t k = 0; k < c.clauses.size(); k++) {
+    runLine(c.clauses[k].first);
+    // exit / break / continue inside a condition: stop here, the enclosing loop will act on it
+    if (gExit || gBreakLevel > 0 || gContinueLevel > 0) { return gLastStatus; }
+    if (gLastStatus == 0) {
+      runLine(c.clauses[k].second);
+      return gLastStatus;
+    }
+  }
+  if (c.haveElse) {
+    runLine(c.elseBody);
+    return gLastStatus;
+  }
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,14 +1405,18 @@ static void runLine(const std::string &line) {
   std::string error;
   if (!splitList(clean, items, error)) { err(error); gLastStatus = 2; return; }
   char before = ';';
-  for (size_t k = 0; k < items.size() && !gExit; k++) {
+  // after a break / continue the rest of the list is skipped, the enclosing loop picks it up
+  for (size_t k = 0; k < items.size() && !gExit && gBreakLevel == 0 && gContinueLevel == 0; k++) {
     const bool run = before == ';' || before == '&' || before == 0
                   || (before == 'a' && gLastStatus == 0)
                   || (before == 'o' && gLastStatus != 0);
     if (run) {
       if (items[k].isCompound) {
         const Compound &c = items[k].compound;
-        const int st = (c.keyword == "for") ? runForLoop(c) : runWhileLoop(c);
+        int st;
+        if (c.keyword == "for") { st = runForLoop(c); }
+        else if (c.keyword == "if") { st = runIf(c); }
+        else { st = runWhileLoop(c); }
         gLastStatus = st & 0xFF;
       } else {
         runPipelineText(items[k].text, items[k].op == '&');
@@ -1401,11 +1479,19 @@ static char *commandGenerator(const char *text, int state) {
   return NULL;
 }
 
+// A word after which a new command starts
+static bool startsCommand(const std::string &w) {
+  return w == "then" || w == "else" || w == "elif" || w == "do" || w == "if" || w == "while" || w == "until";
+}
+
 static char **myCompletion(const char *text, int start, int end) {
   static_cast<void>(end);
   int k = start - 1;
   while (k >= 0 && isBlank(rl_line_buffer[k])) { k--; }
   if (k < 0 || std::strchr("|;&(", rl_line_buffer[k])) { return rl_completion_matches(text, commandGenerator); }
+  int b = k;
+  while (b >= 0 && !isBlank(rl_line_buffer[b]) && !std::strchr("|;&(", rl_line_buffer[b])) { b--; }
+  if (startsCommand(std::string(rl_line_buffer + b + 1, static_cast<size_t>(k - b)))) { return rl_completion_matches(text, commandGenerator); }
   return NULL;
 }
 
