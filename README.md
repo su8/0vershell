@@ -23,7 +23,7 @@ In Debian it's `libreadline-dev`, in your other OS's search for `readline`. It's
 
 1. `Completed`. ~Parse `while` / `for` loops.~
 
-2. Parse `if/else/fi`.
+2. `Completed`. ~Parse `if/else/fi`.~
 
 3. Parse longer lines and lines that contain `/` that act to append code on newline(s), e.g multiline code stored in a single variable.
 
